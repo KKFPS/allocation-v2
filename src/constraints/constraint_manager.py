@@ -46,6 +46,9 @@ class ConstraintManager:
         
         for name, constraint_class in constraint_classes.items():
             config = configs.get(name, {'enabled': True, 'params': {}, 'penalty': -20})
+
+            logger.info(f"Config for {name}: {config}")
+            logger.info(f"Config for {name}: {configs}")
             
             # Route overlap is always enabled (mandatory)
             if name == 'route_overlap':
