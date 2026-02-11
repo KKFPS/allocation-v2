@@ -99,7 +99,7 @@ class ChargerPreferenceConstraint(BaseConstraint):
             Bonus/penalty based on charger priority and route position
         """
 
-        logger.debug(f"Evaluating charger preference enabled: {self.enabled} for vehicle: {vehicle.vehicle_id} with routes: {[r.route_id for r in route_sequence]} and charger map: {kwargs.get('vehicle_charger_map', {})} and charger preference map: {self.charger_preference_map}")
+        # logger.debug(f"Evaluating charger preference enabled: {self.enabled} for vehicle: {vehicle.vehicle_id} with routes: {[r.route_id for r in route_sequence]} and charger map: {kwargs.get('vehicle_charger_map', {})} and charger preference map: {self.charger_preference_map}")
         if not self.enabled:
             return 0.0
         
@@ -115,9 +115,9 @@ class ChargerPreferenceConstraint(BaseConstraint):
         all_routes = kwargs.get('all_routes', [])
         all_vehicles = kwargs.get('all_vehicles', [])
 
-        logger.debug(f"Vehicle charger map: {vehicle_charger_map}")
-        logger.debug(f"All routes: {all_routes}")
-        logger.debug(f"All vehicles: {all_vehicles}")
+        # logger.debug(f"Vehicle charger map: {vehicle_charger_map}")
+        # logger.debug(f"All routes: {all_routes}")
+        # logger.debug(f"All vehicles: {all_vehicles}")
         
         if not all_routes or not all_vehicles:
             return 0.0
