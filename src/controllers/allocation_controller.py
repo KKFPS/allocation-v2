@@ -63,7 +63,7 @@ class AllocationController:
             
             # Phase 3: Define 18-hour window and load data
             window_start, window_end = self._calculate_allocation_window(current_time)
-            vehicles = self._load_vehicles()
+            vehicles = self._load_vehicles(current_time)
             routes = self._load_routes(window_start, window_end)
             
             logger.info(f"Window: {window_start} to {window_end}")
@@ -169,8 +169,13 @@ class AllocationController:
         
         return window_start, window_end
     
-    def _load_vehicles(self) -> List[Vehicle]:
-        """Load active vehicles for site."""
+    def _load_vehicles(self, as_of_time: Optional[datetime] = None) -> List[Vehicle]:
+        """Load active vehicles for site.
+        
+        Args:
+            as_of_time: If set, vehicle state (estimated_soc, available_time) is
+                evaluated at this time (e.g. allocation start from --start-time).
+        """
         rows = db.execute_query(
             Queries.GET_ACTIVE_VEHICLES,
             (self.site_id,),
@@ -188,19 +193,32 @@ class AllocationController:
             vehicle = Vehicle(**row)
             
             # Load current state from VSM
-            self._load_vehicle_state(vehicle)
+            self._load_vehicle_state(vehicle, as_of_time)
             
             vehicles.append(vehicle)
         
         return vehicles
     
-    def _load_vehicle_state(self, vehicle: Vehicle):
-        """Load current vehicle state from VSM."""
-        vsm_data = db.execute_query(
-            Queries.GET_LATEST_VSM,
-            (vehicle.vehicle_id,),
-            fetch=True
-        )
+    def _load_vehicle_state(self, vehicle: Vehicle, as_of_time: Optional[datetime] = None):
+        """Load vehicle state from VSM.
+        
+        When as_of_time is set (e.g. allocation start from --start-time), uses
+        VSM state at or before that time for estimated_soc and sets available_time
+        from that timestamp. When None, uses latest VSM and datetime.now().
+        """
+        reference_time = as_of_time if as_of_time is not None else datetime.now()
+        if as_of_time is not None:
+            vsm_data = db.execute_query(
+                Queries.GET_VSM_AS_OF,
+                (vehicle.vehicle_id, as_of_time),
+                fetch=True
+            )
+        else:
+            vsm_data = db.execute_query(
+                Queries.GET_LATEST_VSM,
+                (vehicle.vehicle_id,),
+                fetch=True
+            )
         
         if vsm_data:
             vsm = vsm_data[0]
@@ -214,9 +232,13 @@ class AllocationController:
             if vehicle.current_status == 'On-Route' and vehicle.return_eta:
                 vehicle.available_time = vehicle.return_eta
             else:
-                vehicle.available_time = datetime.now()
-            
-            vehicle.available_energy_kwh = vehicle.get_available_energy(datetime.now())
+                vehicle.available_time = reference_time
+            vehicle.available_energy_kwh = vehicle.get_available_energy(reference_time)
+        else:
+            # No VSM at or before as_of_time: treat as available from reference time
+            if as_of_time is not None:
+                vehicle.available_time = as_of_time
+            vehicle.available_energy_kwh = vehicle.get_available_energy(reference_time)
     
     def _load_routes(self, window_start: datetime, window_end: datetime) -> List[Route]:
         """Load routes within allocation window."""

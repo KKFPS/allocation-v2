@@ -62,6 +62,17 @@ class Queries:
         LIMIT 1
     """
     
+    GET_VSM_AS_OF = """
+        SELECT 
+            vehicle_id, date_time, status, route_id,
+            estimated_soc, return_eta, return_soc
+        FROM t_vsm
+        WHERE vehicle_id = %s
+            AND date_time <= %s
+        ORDER BY date_time DESC
+        LIMIT 1
+    """
+    
     GET_ALL_VSM_FOR_SITE = """
         SELECT DISTINCT ON (vsm.vehicle_id)
             vsm.vehicle_id, vsm.date_time, vsm.status, vsm.route_id,

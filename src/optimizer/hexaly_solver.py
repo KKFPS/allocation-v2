@@ -7,12 +7,17 @@ from src.utils.logging_config import logger
 from src.config import IS_HEXALY_ACTIVE
 
 
+# Weight so that one extra allocated route dominates any realistic score delta
+ROUTE_COUNT_WEIGHT = 1e2
+
+
 class HexalySolver:
     """
     Hexaly Cloud optimizer for vehicle-route allocation.
     
-    Solves the set covering problem: assign each route to exactly one vehicle
-    while maximizing total score (minimizing penalties).
+    Maximizes the number of routes allocated (then total score). Each route is
+    covered at most once; each vehicle is used by at most one sequence. Some
+    routes may be left unallocated when mathematically justified.
     """
     
     def __init__(self, time_limit_seconds: int = 30):
@@ -29,13 +34,16 @@ class HexalySolver:
         """
         Solve allocation optimization problem.
         
+        Maximizes number of routes allocated, then total score. Each vehicle
+        is used by at most one sequence; some routes may be left unallocated.
+        
         Args:
             sequences: List of (vehicle_id, route_sequence, cost) tuples
             route_ids: List of all route IDs that need assignment
             sequence_costs: Costs for each sequence
         
         Returns:
-            Dictionary with selected_sequences and total_score
+            Dictionary with selected_sequences, total_score, solve_time, status
         """
         # Check if Hexaly is active, otherwise use greedy fallback
         if not IS_HEXALY_ACTIVE:
@@ -56,21 +64,35 @@ class HexalySolver:
                 
                 # Build route-to-sequence mapping
                 route_coverage = {route_id: [] for route_id in route_ids}
-                
+                # Build vehicle-to-sequence mapping (one sequence per vehicle)
+                vehicle_to_sequences = {}
                 for seq_idx, (vehicle_id, route_sequence, cost) in enumerate(sequences):
+                    vehicle_to_sequences.setdefault(vehicle_id, []).append(seq_idx)
                     for route in route_sequence:
                         if route.route_id in route_coverage:
                             route_coverage[route.route_id].append(seq_idx)
                 
-                # Constraints: Each route covered exactly once
+                # Constraint: Each vehicle used by at most one sequence
+                for vehicle_id, seq_indices in vehicle_to_sequences.items():
+                    model.constraint(
+                        model.sum([sequence_vars[i] for i in seq_indices]) <= 1
+                    )
+                
+                # Constraints: Each route covered at most once; route_covered for objective
+                route_covered_vars = {}
                 uncovered_routes = 0
                 for route_id in route_ids:
                     covering_sequences = route_coverage[route_id]
                     
                     if covering_sequences:
-                        # Sum of selected sequences covering this route must equal 1
                         coverage_sum = model.sum([sequence_vars[idx] for idx in covering_sequences])
-                        model.constraint(coverage_sum == 1)
+                        # At most one selected sequence covers this route
+                        model.constraint(coverage_sum <= 1)
+                        # Binary: route is covered iff at least one covering sequence selected
+                        route_covered = model.bool()
+                        route_covered_vars[route_id] = route_covered
+                        model.constraint(route_covered <= coverage_sum)
+                        model.constraint(coverage_sum <= len(covering_sequences) * route_covered)
                         logger.debug(f"Route {route_id}: {len(covering_sequences)} covering sequences")
                     else:
                         uncovered_routes += 1
@@ -79,9 +101,13 @@ class HexalySolver:
                 if uncovered_routes > 0:
                     logger.warning(f"{uncovered_routes} routes have no feasible assignments")
                 
-                # Objective: Maximize total score (minimize penalties)
-                # Since costs are penalties (negative), maximizing sum is desirable
-                objective = model.sum([sequence_vars[i] * sequence_costs[i] for i in range(n_sequences)])
+                # Objective: Maximize routes allocated, then total score
+                score_term = model.sum([sequence_vars[i] * sequence_costs[i] for i in range(n_sequences)])
+                if route_covered_vars:
+                    route_count_term = model.sum(list(route_covered_vars.values()))
+                    objective = ROUTE_COUNT_WEIGHT * route_count_term + score_term
+                else:
+                    objective = score_term
                 model.maximize(objective)
                 
                 model.close()
@@ -94,13 +120,20 @@ class HexalySolver:
                 selected_indices = [i for i in range(n_sequences) if sequence_vars[i].value == 1]
                 selected_sequences = [sequences[i] for i in selected_indices]
                 total_score = sum(sequences[i][2] for i in selected_indices)
+                routes_allocated = sum(1 for r in route_covered_vars if route_covered_vars[r].value == 1)
+                routes_unallocated = n_routes - routes_allocated
                 
-                logger.info(f"Optimization complete: {len(selected_sequences)} sequences selected, score={total_score:.2f}")
+                logger.info(
+                    f"Optimization complete: {len(selected_sequences)} sequences selected, "
+                    f"{routes_allocated}/{n_routes} routes allocated, score={total_score:.2f}"
+                )
+                if routes_unallocated > 0:
+                    logger.info(f"  {routes_unallocated} routes left unallocated")
                 logger.debug(f"\nSelected sequences:")
                 for idx in selected_indices:
                     vehicle_id, route_seq, cost = sequences[idx]
-                    route_ids = [r.route_id for r in route_seq]
-                    logger.debug(f"  Vehicle {vehicle_id}: {len(route_seq)} routes {route_ids}, cost={cost:.2f}")
+                    seq_route_ids = [r.route_id for r in route_seq]
+                    logger.debug(f"  Vehicle {vehicle_id}: {len(route_seq)} routes {seq_route_ids}, cost={cost:.2f}")
                 
                 return {
                     'selected_sequences': selected_sequences,
@@ -134,12 +167,16 @@ class HexalySolver:
         
         selected_sequences = []
         covered_routes = set()
+        used_vehicles = set()
         total_score = 0.0
         
         for idx in sorted_indices:
             vehicle_id, route_sequence, cost = sequences[idx]
             route_ids_in_seq = [r.route_id for r in route_sequence]
             
+            # Each vehicle can be used by at most one sequence
+            if vehicle_id in used_vehicles:
+                continue
             # Check if any routes already covered
             if any(rid in covered_routes for rid in route_ids_in_seq):
                 continue
@@ -147,13 +184,17 @@ class HexalySolver:
             # Select this sequence
             selected_sequences.append(sequences[idx])
             covered_routes.update(route_ids_in_seq)
+            used_vehicles.add(vehicle_id)
             total_score += cost
             
             # If all routes covered, done
             if len(covered_routes) == len(route_ids):
                 break
         
-        logger.info(f"Greedy solution: {len(selected_sequences)} sequences, score={total_score:.2f}")
+        logger.info(
+            f"Greedy solution: {len(selected_sequences)} sequences, "
+            f"{len(covered_routes)}/{len(route_ids)} routes allocated, score={total_score:.2f}"
+        )
         
         return {
             'selected_sequences': selected_sequences,

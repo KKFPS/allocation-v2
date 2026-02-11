@@ -22,7 +22,7 @@ class ShiftHoursStrictConstraint(BaseConstraint):
         if not self.enabled or not route_sequence:
             return 0.0
         
-        max_hours = self.params.get('max_hours', 12)
+        max_hours = self.params.get('max_hours', 16)
         calculation_method = self.params.get('calculation_method', 'first_to_last')
         pre_shift_buffer = self.params.get('pre_shift_buffer_hours', 0.5)
         post_shift_buffer = self.params.get('post_shift_buffer_hours', 0.5)
