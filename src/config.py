@@ -59,3 +59,7 @@ DEFAULT_PENALTIES = {
     'swap_minimization': 0.5,
     'energy_optimization': 0.5
 }
+
+DEFAULT_CONSTRAINT_ENABLED = {
+    'charger_preference': False,
+}

@@ -40,16 +40,10 @@ class ConstraintManager:
             'route_overlap': RouteOverlapConstraint,
             'charger_preference': ChargerPreferenceConstraint,
         }
-
-        logger.info(f"Constraint classes: {constraint_classes}")
-        logger.info(f"Configs: {configs}")
         
         for name, constraint_class in constraint_classes.items():
             config = configs.get(name, {'enabled': True, 'params': {}, 'penalty': -20})
 
-            logger.info(f"Config for {name}: {config}")
-            logger.info(f"Config for {name}: {configs}")
-            
             # Route overlap is always enabled (mandatory)
             if name == 'route_overlap':
                 config['enabled'] = True

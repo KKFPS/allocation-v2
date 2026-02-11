@@ -69,7 +69,7 @@ class AllocationController:
             logger.info(f"Window: {window_start} to {window_end}")
             logger.info(f"Loaded {len(vehicles)} vehicles, {len(routes)} routes")
 
-            logger.info(f"Site config: {self.site_config}")
+            # logger.info(f"Site config: {self.site_config}")
             # Phase 4: Initialize constraint manager
             constraint_configs = get_all_constraint_configs(self.site_id, self.site_config)
             self.constraint_manager = ConstraintManager(constraint_configs)

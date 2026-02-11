@@ -4,8 +4,7 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, Optional
 from src.utils.logging_config import logger
-from src.config import DEFAULT_PENALTIES
-
+from src.config import DEFAULT_PENALTIES, DEFAULT_CONSTRAINT_ENABLED
 
 def parse_maf_parameter(param_key: str, param_value: str) -> Any:
     """
@@ -85,7 +84,7 @@ def get_constraint_config(site_id: int, constraint_name: str, maf_params: Dict[s
         Dictionary with 'enabled' (bool), 'params' (dict), 'penalty' (numeric)
     """
     enabled_key = f"constraint_{constraint_name}_enabled"
-    enabled_value = maf_params.get(enabled_key, "true")
+    enabled_value = str(maf_params.get(enabled_key, DEFAULT_CONSTRAINT_ENABLED.get(constraint_name, "true")))
     enabled = parse_maf_parameter(enabled_key, enabled_value)
     
     if not enabled:
@@ -127,50 +126,54 @@ def parse_maf_response(maf_json: Dict) -> Dict[int, Dict[str, Any]]:
     
     try:
         clients = maf_json.get('clients', [])
-        
+        logger.info(f"Clients: {clients}")
         for client in clients:
-            sites = client.get('sites', [])
-            
-            for site in sites:
-                try:
-                    site_id = site.get('site_id')
-                    if not site_id:
-                        continue
+            try:
+                sites = client.get('sites', [])
+                
+                for site in sites:
+                    try:
+                        site_id = site.get('site_id')
+                        if not site_id:
+                            continue
 
-                    # Parse site-level parameters
-                    site_params = {}
-                    parameters = site.get('parameters', {})
+                        # Parse site-level parameters
+                        site_params = {}
+                        parameters = site.get('parameters', {})
 
-                    # logger.info(f"Site parameters: {parameters}")
-                    for param in parameters:
-                        # logger.info(f"Parsing MAF parameter: {param.get('parameter_name')} = {param.get('parameter_value')}")
-                        site_params[param.get('parameter_name')] = parse_maf_parameter(param.get('parameter_name'), param.get('parameter_value'))
-                    
-                    # Parse vehicle-specific parameters
-                    vehicles = site.get('vehicles', [])
-                    enabled_vehicles = []
-                    
-                    for vehicle in vehicles:
-                        vehicle_id = vehicle.get('vehicle_id')
-                        enabled = parse_maf_parameter('enabled', vehicle.get('enabled', 'true'))
+                        logger.info(f"Site parameters: {parameters}")
+                        for param in parameters:
+                            # logger.info(f"Parsing MAF parameter: {param.get('parameter_name')} = {param.get('parameter_value')}")
+                            site_params[param.get('parameter_name')] = parse_maf_parameter(param.get('parameter_name'), param.get('parameter_value'))
                         
-                        if enabled and vehicle_id:
-                            enabled_vehicles.append(vehicle_id)
+                        # Parse vehicle-specific parameters
+                        vehicles = site.get('vehicles', [])
+                        enabled_vehicles = []
+                        
+                        for vehicle in vehicles:
+                            vehicle_id = vehicle.get('vehicle_id')
+                            enabled = parse_maf_parameter('enabled', vehicle.get('enabled', 'true'))
+                            
+                            if enabled and vehicle_id:
+                                enabled_vehicles.append(vehicle_id)
 
-                    logger.info(f"Enabled vehicles: {enabled_vehicles}")
-                    # logger.info(f"Site parameters: {site_params}")
-                    
-                    site_configs[site_id] = {
-                        'parameters': site_params,
-                        'enabled_vehicles': enabled_vehicles
-                    }
+                        logger.info(f"Enabled vehicles: {enabled_vehicles}")
+                        # logger.info(f"Site parameters: {site_params}")
+                        
+                        site_configs[site_id] = {
+                            'parameters': site_params,
+                            'enabled_vehicles': enabled_vehicles
+                        }
 
-                    # logger.info(f"Loaded MAF config for site {site_id}: {site_configs[site_id]}")
-                    
-                    # logger.info(f"Loaded MAF config for site {site_id}: {len(site_params)} parameters, {len(enabled_vehicles)} enabled vehicles")
-                except Exception as e:
-                    logger.error(f"Failed to parse MAF config for site {site_id}: {e}")
-                    continue
+                        # logger.info(f"Loaded MAF config for site {site_id}: {site_configs[site_id]}")
+                        
+                        # logger.info(f"Loaded MAF config for site {site_id}: {len(site_params)} parameters, {len(enabled_vehicles)} enabled vehicles")
+                    except Exception as e:
+                        logger.error(f"Failed to parse MAF config for site {site_id}: {e}")
+                        continue
+            except Exception as e:
+                logger.error(f"Failed to parse MAF config for client {client.get('client_id')}: {e}")
+                continue
         return site_configs
         
     except Exception as e:
@@ -219,6 +222,8 @@ def get_all_constraint_configs(site_id: int, site_config: Dict) -> Dict[str, Dic
     
     constraints = {}
     maf_params = site_config.get('parameters', {})
+
+    logger.info(f"MAF params: {maf_params}")
     
     for constraint_name in constraint_names:
         constraints[constraint_name] = get_constraint_config(site_id, constraint_name, maf_params)

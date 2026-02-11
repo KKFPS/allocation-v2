@@ -40,9 +40,6 @@ class ChargerPreferenceConstraint(BaseConstraint):
         # - Legacy: {"87":"3","86":"1","DISC":"-3"}  (single charger id per key)
         charger_map_str = (self.params.get('map') or '{}').strip()
 
-        # Default to disabled if not specified
-        self.enabled = self.params.get('enabled', False)
-
         try:
             if re.match(r'^\s*\[', charger_map_str):
                 # New format: [id1,id2,...]:value,[...]:value
