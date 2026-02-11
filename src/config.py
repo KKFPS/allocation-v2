@@ -55,7 +55,7 @@ DEFAULT_PENALTIES = {
     'shift_hours_strict': -20,
     'minimum_soonness': -20,
     'route_overlap': -20,
-    # 'charger_preference': 3,
+    'charger_preference': 3,
     'swap_minimization': 0.5,
     'energy_optimization': 0.5
 }
