@@ -1,6 +1,6 @@
 """Cost matrix builder for allocation optimization."""
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from itertools import combinations
 from src.models.vehicle import Vehicle
 from src.models.route import Route
@@ -12,7 +12,8 @@ class CostMatrixBuilder:
     """Builds cost matrix for vehicle-route assignments."""
     
     def __init__(self, vehicles: List[Vehicle], routes: List[Route], 
-                 constraint_manager: ConstraintManager, max_routes_per_vehicle: int = 5):
+                 constraint_manager: ConstraintManager, max_routes_per_vehicle: int = 5,
+                 vehicle_charger_map: Dict[int, Optional[str]] = None):
         """
         Initialize cost matrix builder.
         
@@ -21,11 +22,13 @@ class CostMatrixBuilder:
             routes: List of routes to allocate
             constraint_manager: Constraint evaluation manager
             max_routes_per_vehicle: Maximum routes per vehicle in window
+            vehicle_charger_map: Dict mapping vehicle_id -> charger_id or None (one vehicle per charger)
         """
         self.vehicles = vehicles
         self.routes = routes
         self.constraint_manager = constraint_manager
         self.max_routes_per_vehicle = max_routes_per_vehicle
+        self.vehicle_charger_map = vehicle_charger_map or {}
         
         self.n_vehicles = len(vehicles)
         self.n_routes = len(routes)
@@ -51,7 +54,12 @@ class CostMatrixBuilder:
         
         # Single route assignments
         for route in self.routes:
-            evaluation = self.constraint_manager.evaluate_sequence(vehicle, [route])
+            evaluation = self.constraint_manager.evaluate_sequence(
+                vehicle, [route], 
+                vehicle_charger_map=self.vehicle_charger_map,
+                all_routes=self.routes,
+                all_vehicles=self.vehicles
+            )
             if evaluation is None:
                 logger.warning(
                     f"evaluate_sequence returned None for vehicle {vehicle.vehicle_id} route {route.route_id}; skipping"
@@ -73,7 +81,12 @@ class CostMatrixBuilder:
                 route_sequence = sorted(route_combo, key=lambda r: r.plan_start_date_time)
                 
                 # Evaluate sequence
-                evaluation = self.constraint_manager.evaluate_sequence(vehicle, route_sequence)
+                evaluation = self.constraint_manager.evaluate_sequence(
+                    vehicle, route_sequence, 
+                    vehicle_charger_map=self.vehicle_charger_map,
+                    all_routes=self.routes,
+                    all_vehicles=self.vehicles
+                )
                 if evaluation is None:
                     logger.warning(
                         f"evaluate_sequence returned None for vehicle {vehicle.vehicle_id} "

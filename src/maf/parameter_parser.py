@@ -37,7 +37,7 @@ def parse_maf_parameter(param_key: str, param_value: str) -> Any:
             return json.loads(param_value)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON array for {param_key}: {param_value} - {e}")
-            return None
+            return param_value
     
     # JSON object
     if param_value.strip().startswith('{'):
@@ -45,7 +45,7 @@ def parse_maf_parameter(param_key: str, param_value: str) -> Any:
             return json.loads(param_value)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON object for {param_key}: {param_value} - {e}")
-            return None
+            return param_value
     
     # Numeric detection
     numeric_suffixes = ['_minutes', '_hours', '_seconds', '_kwh', '_penalty', 
@@ -95,8 +95,9 @@ def get_constraint_config(site_id: int, constraint_name: str, maf_params: Dict[s
     # Extract all parameters for this constraint
     constraint_params = {}
     prefix = f"constraint_{constraint_name}_"
-    
+    # logger.info(f"Parsing MAF parameters for constraint '{constraint_name}': {maf_params}")
     for key, value in maf_params.items():
+        # logger.info(f"Parsing MAF parameter: {key} = {value}")
         if key.startswith(prefix) and key != enabled_key:
             param_name = key[len(prefix):]
             constraint_params[param_name] = parse_maf_parameter(key, value)
@@ -136,17 +137,14 @@ def parse_maf_response(maf_json: Dict) -> Dict[int, Dict[str, Any]]:
                     if not site_id:
                         continue
 
-                    logger.info(f"Loaded MAF config for site {site_id}: {site}")
-                    logger.info(f"Loaded MAF config for site {site_id}: {site.get('parameters', {})}")
-                    
                     # Parse site-level parameters
                     site_params = {}
                     parameters = site.get('parameters', {})
 
-                    logger.info(f"Loaded MAF config for site {site_id}: {parameters}")
-                    
-                    for key, value in parameters.items():
-                        site_params[key] = parse_maf_parameter(key, value)
+                    # logger.info(f"Site parameters: {parameters}")
+                    for param in parameters:
+                        # logger.info(f"Parsing MAF parameter: {param.get('parameter_name')} = {param.get('parameter_value')}")
+                        site_params[param.get('parameter_name')] = parse_maf_parameter(param.get('parameter_name'), param.get('parameter_value'))
                     
                     # Parse vehicle-specific parameters
                     vehicles = site.get('vehicles', [])
@@ -158,13 +156,18 @@ def parse_maf_response(maf_json: Dict) -> Dict[int, Dict[str, Any]]:
                         
                         if enabled and vehicle_id:
                             enabled_vehicles.append(vehicle_id)
+
+                    logger.info(f"Enabled vehicles: {enabled_vehicles}")
+                    # logger.info(f"Site parameters: {site_params}")
                     
                     site_configs[site_id] = {
                         'parameters': site_params,
                         'enabled_vehicles': enabled_vehicles
                     }
+
+                    # logger.info(f"Loaded MAF config for site {site_id}: {site_configs[site_id]}")
                     
-                    logger.info(f"Loaded MAF config for site {site_id}: {len(site_params)} parameters, {len(enabled_vehicles)} enabled vehicles")
+                    # logger.info(f"Loaded MAF config for site {site_id}: {len(site_params)} parameters, {len(enabled_vehicles)} enabled vehicles")
                 except Exception as e:
                     logger.error(f"Failed to parse MAF config for site {site_id}: {e}")
                     continue

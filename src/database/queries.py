@@ -92,6 +92,22 @@ class Queries:
         LIMIT 1
     """
     
+    GET_VEHICLE_CHARGERS_IN_WINDOW = """
+        WITH latest_charges AS (
+            SELECT DISTINCT ON (vehicle_id)
+                vehicle_id,
+                charger_id,
+                start_date_time
+            FROM t_vehicle_charge
+            WHERE vehicle_id = ANY(%s)
+                AND start_date_time < %s
+                AND start_date_time > %s - interval '18 hours'
+            ORDER BY vehicle_id, start_date_time DESC
+        )
+        SELECT vehicle_id, charger_id, start_date_time
+        FROM latest_charges
+    """
+    
     # Charger Queries
     GET_SITE_CHARGERS = """
         SELECT charger_id, site_id, max_power, dc_flag

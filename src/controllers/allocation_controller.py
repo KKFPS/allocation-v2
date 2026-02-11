@@ -68,15 +68,19 @@ class AllocationController:
             
             logger.info(f"Window: {window_start} to {window_end}")
             logger.info(f"Loaded {len(vehicles)} vehicles, {len(routes)} routes")
-            
+
+            logger.info(f"Site config: {self.site_config}")
             # Phase 4: Initialize constraint manager
             constraint_configs = get_all_constraint_configs(self.site_id, self.site_config)
             self.constraint_manager = ConstraintManager(constraint_configs)
             logger.info(f"Initialized {self.constraint_manager}")
             
+            # Phase 4.5: Load vehicle charger locations (time-aware)
+            vehicle_charger_map = self._load_vehicle_chargers(vehicles, current_time)
+            
             # Phase 5: Build cost matrix and optimize
             allocation_result = self._optimize_allocation(
-                vehicles, routes, window_start, window_end
+                vehicles, routes, window_start, window_end, vehicle_charger_map
             )
             
             # Phase 6: Validate and persist results
@@ -146,8 +150,8 @@ class AllocationController:
             if result:
                 maf_json = result[0]['sp_get_module_params']
                 site_configs = parse_maf_response(maf_json)
-                self.site_config = site_configs.get(self.site_id, {})
-                logger.info(f"Loaded MAF configuration for site {self.site_id}")
+                self.site_config = site_configs.get(str(self.site_id), {})
+                # logger.info(f"Loaded MAF configuration for site {self.site_id} : {self.site_config}")
             else:
                 logger.warning("No MAF configuration found, using defaults")
                 self.site_config = {'parameters': {}, 'enabled_vehicles': []}
@@ -255,8 +259,33 @@ class AllocationController:
         
         return routes
     
+    def _load_vehicle_chargers(self, vehicles: List[Vehicle], 
+                              reference_time: Optional[datetime] = None) -> Dict[int, Optional[str]]:
+        """
+        Load vehicle charger locations within 18-hour window before reference time.
+        At most one vehicle per charger: if multiple vehicles used the same charger,
+        only the one with the latest start_time keeps it; others get None.
+        
+        Args:
+            vehicles: List of vehicles
+            reference_time: Reference datetime (allocation start time from --start-time)
+        
+        Returns:
+            Dict mapping vehicle_id -> charger_id or None (if vehicle lost charger to a later one)
+        """
+        if not vehicles:
+            return {}
+        
+        vehicle_ids = [v.vehicle_id for v in vehicles]
+        vehicle_charger_map = db.get_vehicle_chargers_in_window(vehicle_ids, reference_time)
+        
+        logger.info(f"Loaded charger locations for {len(vehicle_charger_map)}/{len(vehicles)} vehicles")
+        logger.debug(f"Vehicle charger map: {vehicle_charger_map}")
+        return vehicle_charger_map
+    
     def _optimize_allocation(self, vehicles: List[Vehicle], routes: List[Route],
-                           window_start: datetime, window_end: datetime) -> AllocationResult:
+                           window_start: datetime, window_end: datetime,
+                           vehicle_charger_map: Optional[Dict[int, Optional[str]]] = None) -> AllocationResult:
         """
         Run optimization to allocate routes to vehicles.
         
@@ -288,7 +317,8 @@ class AllocationController:
         )
         
         builder = CostMatrixBuilder(
-            vehicles, routes, self.constraint_manager, max_routes
+            vehicles, routes, self.constraint_manager, max_routes,
+            vehicle_charger_map=vehicle_charger_map or {}
         )
         
         sequence_costs, sequences, metadata = builder.build_assignment_matrix()

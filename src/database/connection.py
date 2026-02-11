@@ -108,6 +108,53 @@ class DatabaseConnection:
             except psycopg2.ProgrammingError:
                 # No results to fetch
                 return None
+    
+    def get_vehicle_chargers_in_window(self, vehicle_ids, reference_time):
+        """
+        Get most recent charger for each vehicle within 18-hour window before reference time.
+        At most one vehicle per charger: if multiple vehicles used the same charger,
+        only the one with the latest start_date_time keeps it; others get None.
+        
+        Args:
+            vehicle_ids: List of vehicle IDs
+            reference_time: Reference datetime (or None for current time)
+        
+        Returns:
+            Dict mapping every vehicle_id -> charger_id or None. Size equals len(vehicle_ids).
+        """
+        from src.database.queries import Queries
+        from datetime import datetime
+        
+        if not vehicle_ids:
+            return {}
+        
+        # Use reference time or current time
+        ref_time = reference_time or datetime.now()
+        
+        query = Queries.GET_VEHICLE_CHARGERS_IN_WINDOW
+        # Pass vehicle_ids as a list for ANY() operator, and ref_time twice
+        results = self.execute_query(query, (vehicle_ids, ref_time, ref_time))
+        
+        # One entry per vehicle; vehicles with no charge in window or that lost charger get None
+        charger_map = {vid: None for vid in vehicle_ids}
+        
+        if results:
+            # One vehicle per charger: for each charger keep only the vehicle with latest start_date_time
+            charger_to_best = {}  # charger_id -> (vehicle_id, start_date_time)
+            for row in results:
+                vid, cid, start_dt = row['vehicle_id'], row['charger_id'], row['start_date_time']
+                if cid not in charger_to_best or start_dt > charger_to_best[cid][1]:
+                    charger_to_best[cid] = (vid, start_dt)
+            for row in results:
+                vid, cid = row['vehicle_id'], row['charger_id']
+                if charger_to_best[cid][0] == vid:
+                    charger_map[vid] = cid
+
+        assigned = sum(1 for v in charger_map.values() if v is not None)
+        logger.info(f"Retrieved chargers for {assigned}/{len(vehicle_ids)} vehicles "
+                   f"(reference time: {ref_time})")
+
+        return charger_map
 
 
 # Global database connection instance
