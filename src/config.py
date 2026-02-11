@@ -62,4 +62,12 @@ DEFAULT_PENALTIES = {
 
 DEFAULT_CONSTRAINT_ENABLED = {
     'charger_preference': False,
+    'energy_feasibility': True,
+    'turnaround_time_strict': True,
+    'turnaround_time_preferred': True,
+    'shift_hours_strict': True,
+    'minimum_soonness': True,
+    'route_overlap': True,
+    'swap_minimization': True,
+    'energy_optimization': True,
 }
