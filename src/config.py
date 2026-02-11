@@ -1,0 +1,61 @@
+"""Configuration management for allocation system."""
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Database Configuration
+DB_CONFIG = {
+    'user': os.getenv('psgrsql_db_user'),
+    'password': os.getenv('psgrsql_db_pswd'),
+    'database': os.getenv('psgrsql_db_name'),
+    'host': os.getenv('psgrsql_db_host'),
+    'port': os.getenv('psgrsql_db_port', '5432')
+}
+
+# Hexaly Cloud Configuration
+# Import here to avoid circular dependency with logging
+import hexaly.optimizer
+
+cloud_key = os.getenv("HEXALY_CLOUD_KEY")
+cloud_secret = os.getenv("HEXALY_CLOUD_SECRET")
+
+IS_HEXALY_ACTIVE = False
+
+if not cloud_key or not cloud_secret:
+    print("WARNING: HEXALY_CLOUD_KEY or HEXALY_CLOUD_SECRET not set - Using greedy solver fallback")
+else:
+    IS_HEXALY_ACTIVE = True
+    print("INFO: Activating HEXALY solver")
+    if os.getenv("HEXALY_LOCAL_AVAILABLE") == "true":
+        print("INFO: HEXALY_LOCAL_AVAILABLE is true - Using local solver")
+    else:
+        license_text = f"""
+CLOUD_KEY = {cloud_key}
+CLOUD_SECRET = {cloud_secret}
+"""
+        hexaly.optimizer.HxVersion.set_license_content(license_text)
+
+# Application Configuration
+APPLICATION_NAME = os.getenv('WEBSITE_SITE_NAME', 'vehicle_allocation_system')
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Default System Parameters
+DEFAULT_ALLOCATION_WINDOW_HOURS = 18
+DEFAULT_MAX_ROUTES_PER_VEHICLE = 5
+DEFAULT_RESERVE_VEHICLE_COUNT = 2
+DEFAULT_TURNAROUND_TIME_MINUTES = 45
+
+# Default Constraint Penalties
+DEFAULT_PENALTIES = {
+    'energy_feasibility': -20,
+    'turnaround_time_strict': -22,
+    'turnaround_time_preferred': -2,
+    'shift_hours_strict': -20,
+    'minimum_soonness': -20,
+    'route_overlap': -20,
+    'charger_preference': 3,
+    'swap_minimization': 0.5,
+    'energy_optimization': 0.5
+}
