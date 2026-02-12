@@ -47,10 +47,14 @@ class ChargeOptimizer:
         target_soc_percent: float,
         triad_penalty_factor: float,
         synthetic_time_price_factor: float,
-        min_soc_percent: Optional[float] = None
+        min_soc_percent: Optional[float] = None,
+        target_soc_shortfall_penalty: float = 0.2
     ) -> Dict:
         """
         Optimize charging schedule for all vehicles.
+
+        Hard constraints: route energy at departure, site capacity, SOC bounds,
+        charge rate, availability. Target SOC is a soft goal (minimize shortfall).
 
         Args:
             schedule_id: Schedule identifier
@@ -62,22 +66,20 @@ class ChargeOptimizer:
             forecast_data: Site energy forecast (kW) per time slot
             price_data: (price, is_triad) per time slot
             site_capacity_kw: Available site capacity (kW)
-            target_soc_percent: Default target SOC for vehicles without routes
+            target_soc_percent: Target SOC (%) to get as close as possible to (soft)
             triad_penalty_factor: TRIAD period penalty multiplier
             synthetic_time_price_factor: Time preference factor
-            min_soc_percent: Minimum SOC (%) to charge to (default from config, e.g. 75%)
+            min_soc_percent: Unused (kept for API compatibility)
+            target_soc_shortfall_penalty: Penalty per kWh shortfall from target (soft goal)
 
         Returns:
             Dictionary with vehicle_schedules, total_cost, solve_time, status
         """
-        if min_soc_percent is None:
-            min_soc_percent = DEFAULT_MIN_SOC_PERCENT
         if not IS_HEXALY_ACTIVE:
             logger.warning("Hexaly not active - using greedy fallback")
             return self._greedy_fallback(
                 schedule_id, vehicles, vehicle_states, energy_requirements,
-                availability_matrices, time_slots, price_data, target_soc_percent,
-                min_soc_percent
+                availability_matrices, time_slots, price_data, target_soc_percent
             )
         
         try:
@@ -129,11 +131,12 @@ class ChargeOptimizer:
                 # ----- Debug: log requirements and constraints before optimization -----
                 logger.info(
                     "[OPTIMIZER INPUT] schedule_id=%s | vehicles=%s | time_slots=%s | "
-                    "site_capacity_kw=%.2f | target_soc_percent=%.1f | min_soc_percent=%.1f | "
-                    "triad_penalty=%.2f | time_price_factor=%.4f",
+                    "site_capacity_kw=%.2f | target_soc_percent=%.1f (soft) | "
+                    "triad_penalty=%.2f | time_price_factor=%.4f | shortfall_penalty=%.2f",
                     schedule_id, n_vehicles, n_slots,
-                    site_capacity_kw, target_soc_percent, min_soc_percent,
+                    site_capacity_kw, target_soc_percent,
                     triad_penalty_factor, synthetic_time_price_factor,
+                    target_soc_shortfall_penalty,
                 )
                 if time_slots:
                     logger.info(
@@ -250,7 +253,26 @@ class ChargeOptimizer:
                         energy_this_slot = charge_power[t_idx][v_idx] * 0.5
                         cost_terms.append(slot_cost * energy_this_slot)
                 
-                model.minimize(model.sum(cost_terms))
+                # Soft constraint: penalize shortfall from target_soc_percent (get as close as possible)
+                target_shortfall_terms = []
+                for v_idx, vehicle in enumerate(vehicles):
+                    state = vehicle_states.get(vehicle.vehicle_id)
+                    if not state:
+                        continue
+                    target_soc_kwh = (target_soc_percent / 100.0) * state.battery_capacity_kwh
+                    max_shortfall = max(0.0, target_soc_kwh - state.current_soc_kwh)
+                    if max_shortfall <= 0:
+                        continue
+                    # shortfall[v] >= 0 and shortfall[v] >= target - (initial_soc + cum_final)
+                    shortfall_v = model.float(0, max_shortfall)
+                    model.constraint(
+                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - cumulative_energy[n_slots - 1][v_idx]
+                    )
+                    target_shortfall_terms.append(target_soc_shortfall_penalty * shortfall_v)
+                if target_shortfall_terms:
+                    model.minimize(model.sum(cost_terms) + model.sum(target_shortfall_terms))
+                else:
+                    model.minimize(model.sum(cost_terms))
                 
                 # ===== CONSTRAINTS =====
                 
@@ -298,52 +320,21 @@ class ChargeOptimizer:
                                          f"not in time slots")
                             continue
                         
-                        # At departure time, must have sufficient energy
-                        # cumulative_energy + initial_soc >= required_cumulative_energy
-                        # Also enforce minimum charge level (e.g. 75%)
+                        # At departure time, must have sufficient energy for the route only (hard)
                         if checkpoint_idx > 0:
                             required_for_route = max(
                                 0.0,
                                 requirement.cumulative_energy_kwh - state.current_soc_kwh
                             )
-                            min_soc_kwh = (min_soc_percent / 100.0) * state.battery_capacity_kwh
-                            required_for_min_soc = max(
-                                0.0,
-                                min_soc_kwh - state.current_soc_kwh
-                            )
-                            required_energy = max(required_for_route, required_for_min_soc)
-                            
                             model.constraint(
                                 cumulative_energy[checkpoint_idx - 1][v_idx] >= 
-                                required_energy
+                                required_for_route
                             )
-                            
                             logger.debug(f"Vehicle {vehicle.vehicle_id}: "
                                        f"Route {requirement.route_id} at slot {checkpoint_idx} "
-                                       f"requires {required_energy:.2f} kWh")
+                                       f"requires {required_for_route:.2f} kWh")
                 
-                # 3. Target SOC for vehicles without routes
-                for vehicle in vehicles:
-                    v_idx = vehicle_to_idx[vehicle.vehicle_id]
-                    state = vehicle_states.get(vehicle.vehicle_id)
-                    requirements = energy_requirements.get(vehicle.vehicle_id, [])
-                    
-                    if not state:
-                        continue
-                    
-                    if not requirements:
-                        # No routes - charge to at least min_soc_percent, and up to target_soc_percent
-                        effective_target_percent = max(target_soc_percent, min_soc_percent)
-                        target_energy_kwh = (effective_target_percent / 100.0) * state.battery_capacity_kwh
-                        energy_needed = target_energy_kwh - state.current_soc_kwh
-                        
-                        if energy_needed > 0:
-                            model.constraint(
-                                cumulative_energy[n_slots - 1][v_idx] >= energy_needed
-                            )
-                            
-                            logger.debug(f"Vehicle {vehicle.vehicle_id}: "
-                                       f"Target {energy_needed:.2f} kWh by end of window")
+                # 3. Target SOC: soft only (handled in objective via shortfall penalty)
                 
                 # 4. Site Capacity Constraint (EQ-02)
                 for t_idx, slot_time in enumerate(time_slots):
@@ -434,15 +425,13 @@ class ChargeOptimizer:
                     if not state:
                         continue
                     
-                    # Calculate target energy (respect minimum SOC)
-                    min_soc_kwh = (min_soc_percent / 100.0) * state.battery_capacity_kwh
+                    # Target for reporting: route requirement or target_soc_percent (soft goal)
+                    target_soc_kwh = (target_soc_percent / 100.0) * state.battery_capacity_kwh
                     if requirements:
-                        route_target = (requirements[-1].cumulative_energy_kwh +
-                                        state.current_soc_kwh)
-                        target_energy_kwh = max(route_target, min_soc_kwh)
+                        route_min = (requirements[-1].cumulative_energy_kwh + state.current_soc_kwh)
+                        target_energy_kwh = max(route_min, target_soc_kwh)
                     else:
-                        effective_target = max(target_soc_percent, min_soc_percent)
-                        target_energy_kwh = (effective_target / 100.0) * state.battery_capacity_kwh
+                        target_energy_kwh = target_soc_kwh
                     
                     # Extract charge slots
                     charge_slots = []
@@ -500,8 +489,7 @@ class ChargeOptimizer:
             # Fall back to greedy
             return self._greedy_fallback(
                 schedule_id, vehicles, vehicle_states, energy_requirements,
-                availability_matrices, time_slots, price_data, target_soc_percent,
-                min_soc_percent
+                availability_matrices, time_slots, price_data, target_soc_percent
             )
     
     def _find_time_slot_index(self, target_time: datetime, 
@@ -521,16 +509,13 @@ class ChargeOptimizer:
         availability_matrices: Dict[int, VehicleAvailability],
         time_slots: List[datetime],
         price_data: Dict[datetime, Tuple[float, bool]],
-        target_soc_percent: float,
-        min_soc_percent: Optional[float] = None
+        target_soc_percent: float
     ) -> Dict:
         """
         Greedy fallback algorithm when Hexaly unavailable.
         
-        Charges each vehicle during available low-cost periods.
+        Charges each vehicle during available low-cost periods; target is soft (get as close as possible).
         """
-        if min_soc_percent is None:
-            min_soc_percent = DEFAULT_MIN_SOC_PERCENT
         logger.warning("Using greedy fallback algorithm")
         
         vehicle_schedules = []
@@ -545,15 +530,13 @@ class ChargeOptimizer:
             requirements = energy_requirements.get(vehicle.vehicle_id, [])
             availability = availability_matrices.get(vehicle.vehicle_id)
             
-            # Calculate target energy (at least min_soc_percent)
-            min_soc_kwh = (min_soc_percent / 100.0) * state.battery_capacity_kwh
+            # Target: route requirement (hard) or target_soc_percent (soft)
+            target_soc_kwh = (target_soc_percent / 100.0) * state.battery_capacity_kwh
             if requirements:
-                route_target = (requirements[-1].cumulative_energy_kwh +
-                                state.current_soc_kwh)
-                target_energy_kwh = max(route_target, min_soc_kwh)
+                route_min = (requirements[-1].cumulative_energy_kwh + state.current_soc_kwh)
+                target_energy_kwh = max(route_min, target_soc_kwh)
             else:
-                effective_target = max(target_soc_percent, min_soc_percent)
-                target_energy_kwh = (effective_target / 100.0) * state.battery_capacity_kwh
+                target_energy_kwh = target_soc_kwh
             
             energy_needed = target_energy_kwh - state.current_soc_kwh
             

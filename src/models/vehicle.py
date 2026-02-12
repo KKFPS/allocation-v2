@@ -66,13 +66,38 @@ class Vehicle:
         """
         return distance_miles * self.efficiency_kwh_mile
     
-    def calculate_charging_time(self, energy_needed_kwh: float, use_dc: bool = False) -> float:
+    def get_charge_power(self, use_dc: bool = False, charger_max_power: Optional[float] = None) -> float:
+        """
+        Effective charge power (kW): min of vehicle rate and charger max_power when provided.
+        
+        Args:
+            use_dc: Whether to use DC charging
+            charger_max_power: Optional max_power from t_charger; caps vehicle rate
+        
+        Returns:
+            Charge power in kW
+        """
+        base = self.charge_power_dc if use_dc else self.charge_power_ac
+        if charger_max_power is not None:
+            return min(base, charger_max_power)
+        return base
+
+    def calculate_charging_time(
+        self,
+        energy_needed_kwh: float,
+        use_dc: bool = False,
+        charger_max_power: Optional[float] = None,
+    ) -> float:
         """
         Calculate charging time in hours.
+        
+        Uses min(t_vehicle.charge_power_ac/dc, t_charger.max_power) when charger_max_power
+        is provided (e.g. from GET_SITE_CHARGERS).
         
         Args:
             energy_needed_kwh: Energy to charge in kWh
             use_dc: Whether to use DC charging
+            charger_max_power: Optional max_power from t_charger
         
         Returns:
             Charging time in hours
@@ -80,7 +105,7 @@ class Vehicle:
         if energy_needed_kwh <= 0:
             return 0.0
         
-        charge_power = self.charge_power_dc if use_dc else self.charge_power_ac
+        charge_power = self.get_charge_power(use_dc=use_dc, charger_max_power=charger_max_power)
         return energy_needed_kwh / charge_power if charge_power > 0 else float('inf')
     
     def __repr__(self):

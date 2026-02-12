@@ -49,9 +49,18 @@ class EnergyFeasibilityConstraint(BaseConstraint):
                 next_route = route_sequence[route_sequence.index(route) + 1]
                 time_between = (next_route.plan_start_date_time - route.plan_end_date_time).total_seconds() / 3600.0
                 
-                # Calculate potential charging
+                # Calculate potential charging (min of vehicle rate and charger max_power)
                 if time_between > 0:
-                    charge_power = vehicle.charge_power_dc if allow_dc_charging else vehicle.charge_power_ac
+                    charger_max_power = None
+                    site_chargers = kwargs.get("site_chargers") or []
+                    if vehicle.current_charger_id is not None and site_chargers:
+                        for ch in site_chargers:
+                            if ch.get("charger_id") == vehicle.current_charger_id:
+                                charger_max_power = ch.get("max_power")
+                                break
+                    charge_power = vehicle.get_charge_power(
+                        use_dc=allow_dc_charging, charger_max_power=charger_max_power
+                    )
                     potential_charge = time_between * charge_power
                     current_energy = min(current_energy + potential_charge, vehicle.battery_capacity)
         
