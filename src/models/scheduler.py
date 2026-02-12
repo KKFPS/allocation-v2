@@ -35,6 +35,7 @@ class SchedulerConfig:
     
     # Target SOC configuration
     target_soc_percent: float = 95.0
+    min_soc_percent: float = 75.0  # Minimum charge level (e.g. charge at least to 75%)
     battery_factor: float = 1.0  # Max SOC multiplier
     
     # Site capacity configuration
@@ -57,6 +58,13 @@ class SchedulerConfig:
     
     # Route source configuration
     route_source_mode: RouteSourceMode = RouteSourceMode.ROUTE_PLAN_ONLY
+
+    @property
+    def site_capacity_kw(self) -> float:
+        """Site capacity in kW for optimization (from agreed_site_capacity_kva * power_factor * site_usage_factor)."""
+        if self.agreed_site_capacity_kva is None:
+            return 0.0
+        return self.agreed_site_capacity_kva * self.power_factor * self.site_usage_factor
     
     def validate(self) -> List[str]:
         """
@@ -81,6 +89,11 @@ class SchedulerConfig:
         
         if not (50.0 <= self.target_soc_percent <= 100.0):
             errors.append(f"target_soc_percent must be between 50.0 and 100.0, got {self.target_soc_percent}")
+        
+        if not (0.0 <= self.min_soc_percent <= 100.0):
+            errors.append(f"min_soc_percent must be between 0.0 and 100.0, got {self.min_soc_percent}")
+        if self.min_soc_percent > self.target_soc_percent:
+            errors.append(f"min_soc_percent ({self.min_soc_percent}) must be <= target_soc_percent ({self.target_soc_percent})")
         
         return errors
 

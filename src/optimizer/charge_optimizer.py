@@ -1,6 +1,6 @@
 """Hexaly optimization solver for charge scheduling."""
 import hexaly.optimizer as hx
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 
 from src.models.scheduler import (
@@ -9,7 +9,7 @@ from src.models.scheduler import (
 )
 from src.models.vehicle import Vehicle
 from src.utils.logging_config import logger
-from src.config import IS_HEXALY_ACTIVE
+from src.config import IS_HEXALY_ACTIVE, DEFAULT_MIN_SOC_PERCENT
 
 
 class ChargeOptimizer:
@@ -46,11 +46,12 @@ class ChargeOptimizer:
         site_capacity_kw: float,
         target_soc_percent: float,
         triad_penalty_factor: float,
-        synthetic_time_price_factor: float
+        synthetic_time_price_factor: float,
+        min_soc_percent: Optional[float] = None
     ) -> Dict:
         """
         Optimize charging schedule for all vehicles.
-        
+
         Args:
             schedule_id: Schedule identifier
             vehicles: List of vehicles to schedule
@@ -64,18 +65,55 @@ class ChargeOptimizer:
             target_soc_percent: Default target SOC for vehicles without routes
             triad_penalty_factor: TRIAD period penalty multiplier
             synthetic_time_price_factor: Time preference factor
-        
+            min_soc_percent: Minimum SOC (%) to charge to (default from config, e.g. 75%)
+
         Returns:
             Dictionary with vehicle_schedules, total_cost, solve_time, status
         """
+        if min_soc_percent is None:
+            min_soc_percent = DEFAULT_MIN_SOC_PERCENT
         if not IS_HEXALY_ACTIVE:
             logger.warning("Hexaly not active - using greedy fallback")
             return self._greedy_fallback(
                 schedule_id, vehicles, vehicle_states, energy_requirements,
-                availability_matrices, time_slots, price_data, target_soc_percent
+                availability_matrices, time_slots, price_data, target_soc_percent,
+                min_soc_percent
             )
         
         try:
+
+            for vehicle in vehicles:
+                state = vehicle_states.get(vehicle.vehicle_id)
+                requirements = energy_requirements.get(vehicle.vehicle_id, [])
+
+                for requirement in requirements:
+                    checkpoint_idx = self._find_time_slot_index(
+                        requirement.plan_start_date_time, time_slots
+                    )
+
+                    if checkpoint_idx is None:
+                        continue
+
+                    required_energy = max(
+                        0.0,
+                        requirement.cumulative_energy_kwh - state.current_soc_kwh
+                    )
+
+                    max_possible = 0.0
+                    for t in range(checkpoint_idx):
+                        if availability_matrices[vehicle.vehicle_id].availability_matrix[t]:
+                            max_possible += state.ac_charge_rate_kw * 0.5
+
+                    if max_possible < required_energy:
+                        logger.error(
+                            f"Vehicle {vehicle.vehicle_id} infeasible: "
+                            f"required={required_energy:.2f}, "
+                            f"max_possible={max_possible:.2f} "
+                            f"plan_start_date_time={requirement.plan_start_date_time} "
+                            f"checkpoint_idx={checkpoint_idx} "
+                            # f"availability_matrix={availability_matrices[vehicle.vehicle_id].availability_matrix} "
+                        )
+
             with hx.HexalyOptimizer() as optimizer:
                 model = optimizer.model
                 
@@ -87,25 +125,113 @@ class ChargeOptimizer:
                 
                 # Create vehicle index mapping
                 vehicle_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
+
+                # ----- Debug: log requirements and constraints before optimization -----
+                logger.info(
+                    "[OPTIMIZER INPUT] schedule_id=%s | vehicles=%s | time_slots=%s | "
+                    "site_capacity_kw=%.2f | target_soc_percent=%.1f | min_soc_percent=%.1f | "
+                    "triad_penalty=%.2f | time_price_factor=%.4f",
+                    schedule_id, n_vehicles, n_slots,
+                    site_capacity_kw, target_soc_percent, min_soc_percent,
+                    triad_penalty_factor, synthetic_time_price_factor,
+                )
+                if time_slots:
+                    logger.info(
+                        "[OPTIMIZER INPUT] Time window: %s -> %s",
+                        time_slots[0].isoformat(), time_slots[-1].isoformat(),
+                    )
+                # Forecast summary
+                if forecast_data:
+                    fvals = list(forecast_data.values())
+                    logger.info(
+                        "[OPTIMIZER INPUT] Forecast: slots=%s | min=%.2f kW | max=%.2f kW | mean=%.2f kW",
+                        len(forecast_data), min(fvals), max(fvals), sum(fvals) / len(fvals),
+                    )
+                # Price summary
+                if price_data:
+                    prices = [p[0] for p in price_data.values()]
+                    triad_count = sum(1 for p in price_data.values() if p[1])
+                    logger.info(
+                        "[OPTIMIZER INPUT] Price: slots=%s | min=%.4f | max=%.4f | TRIAD slots=%s",
+                        len(price_data), min(prices), max(prices), triad_count,
+                    )
+                # Per-vehicle requirements and constraints
+                for vehicle in vehicles:
+                    state = vehicle_states.get(vehicle.vehicle_id)
+                    requirements = energy_requirements.get(vehicle.vehicle_id, [])
+                    availability = availability_matrices.get(vehicle.vehicle_id)
+                    avail_slots = (
+                        sum(1 for x in availability.availability_matrix if x)
+                        if availability and getattr(availability, "availability_matrix", None)
+                        else 0
+                    )
+                    if state:
+                        logger.info(
+                            "[OPTIMIZER INPUT] Vehicle %s: soc=%.2f kWh (%.1f%%) | capacity=%.2f kWh | "
+                            "charge_rate=%.2f kW | available_slots=%s/%s",
+                            vehicle.vehicle_id,
+                            state.current_soc_kwh,
+                            state.current_soc_percent,
+                            state.battery_capacity_kwh,
+                            state.ac_charge_rate_kw,
+                            avail_slots,
+                            n_slots,
+                        )
+                    for req in requirements:
+                        needed = max(0.0, req.cumulative_energy_kwh - (state.current_soc_kwh if state else 0))
+                        logger.info(
+                            "[OPTIMIZER INPUT]   Route req: route_id=%s | departure=%s | "
+                            "cumulative_energy_kwh=%.2f | needed_from_charge=%.2f kWh",
+                            req.route_id,
+                            req.plan_start_date_time.isoformat(),
+                            req.cumulative_energy_kwh,
+                            needed,
+                        )
+                    if state and not requirements:
+                        target_kwh = (target_soc_percent / 100.0) * state.battery_capacity_kwh
+                        needed = max(0.0, target_kwh - state.current_soc_kwh)
+                        logger.info(
+                            "[OPTIMIZER INPUT]   No routes: target_soc=%.2f kWh | energy_needed=%.2f kWh",
+                            target_kwh, needed,
+                        )
+                # Effective capacity per slot (site_capacity - forecast)
+                if forecast_data and time_slots:
+                    logger.info("[OPTIMIZER INPUT] Effective capacity (site - forecast) per slot:")
+                    for t_idx, slot_time in enumerate(time_slots[:5]):  # first 5
+                        fd = forecast_data.get(slot_time, 0.0)
+                        cap = max(0.0, site_capacity_kw - fd)
+                        logger.info("  slot %s %s: %.2f kW", t_idx, slot_time.isoformat(), cap)
+                    if n_slots > 5:
+                        logger.info("  ... (%s more slots)", n_slots - 5)
+                # ----- End debug -----
+
+                # Finite upper bounds (Hexaly does not accept float('inf'))
+                def _max_charge_kw(v_idx: int) -> float:
+                    state = vehicle_states.get(vehicles[v_idx].vehicle_id)
+                    return state.ac_charge_rate_kw if state else site_capacity_kw
+                def _max_cumulative_kwh(v_idx: int) -> float:
+                    state = vehicle_states.get(vehicles[v_idx].vehicle_id)
+                    if state:
+                        return max(0.0, state.battery_capacity_kwh - state.current_soc_kwh)
+                    return 1000.0
                 
                 # ===== DECISION VARIABLES =====
                 
                 # charge_power[t][v]: Charging power (kW) for vehicle v at time t
                 charge_power = [
-                    [model.float(0, float('inf')) for _ in range(n_vehicles)]
+                    [model.float(0, _max_charge_kw(v_idx)) for v_idx in range(n_vehicles)]
                     for _ in range(n_slots)
                 ]
                 
                 # cumulative_energy[t][v]: Cumulative energy (kWh) delivered by time t
                 cumulative_energy = [
-                    [model.float(0, float('inf')) for _ in range(n_vehicles)]
+                    [model.float(0, _max_cumulative_kwh(v_idx)) for v_idx in range(n_vehicles)]
                     for _ in range(n_slots)
                 ]
                 
                 # ===== OBJECTIVE FUNCTION =====
                 
-                total_cost_expr = model.sum()
-                
+                cost_terms = []
                 for t_idx, slot_time in enumerate(time_slots):
                     # Get electricity price and TRIAD flag
                     price, is_triad = price_data.get(slot_time, (0.15, False))
@@ -122,9 +248,9 @@ class ChargeOptimizer:
                     for v_idx in range(n_vehicles):
                         # Energy delivered in this slot (kWh) = power (kW) × 0.5 hours
                         energy_this_slot = charge_power[t_idx][v_idx] * 0.5
-                        total_cost_expr.add(slot_cost * energy_this_slot)
+                        cost_terms.append(slot_cost * energy_this_slot)
                 
-                model.minimize(total_cost_expr)
+                model.minimize(model.sum(cost_terms))
                 
                 # ===== CONSTRAINTS =====
                 
@@ -174,9 +300,18 @@ class ChargeOptimizer:
                         
                         # At departure time, must have sufficient energy
                         # cumulative_energy + initial_soc >= required_cumulative_energy
+                        # Also enforce minimum charge level (e.g. 75%)
                         if checkpoint_idx > 0:
-                            required_energy = (requirement.cumulative_energy_kwh - 
-                                             state.current_soc_kwh)
+                            required_for_route = max(
+                                0.0,
+                                requirement.cumulative_energy_kwh - state.current_soc_kwh
+                            )
+                            min_soc_kwh = (min_soc_percent / 100.0) * state.battery_capacity_kwh
+                            required_for_min_soc = max(
+                                0.0,
+                                min_soc_kwh - state.current_soc_kwh
+                            )
+                            required_energy = max(required_for_route, required_for_min_soc)
                             
                             model.constraint(
                                 cumulative_energy[checkpoint_idx - 1][v_idx] >= 
@@ -197,8 +332,9 @@ class ChargeOptimizer:
                         continue
                     
                     if not requirements:
-                        # No routes - charge to target SOC by end of window
-                        target_energy_kwh = (target_soc_percent / 100.0) * state.battery_capacity_kwh
+                        # No routes - charge to at least min_soc_percent, and up to target_soc_percent
+                        effective_target_percent = max(target_soc_percent, min_soc_percent)
+                        target_energy_kwh = (effective_target_percent / 100.0) * state.battery_capacity_kwh
                         energy_needed = target_energy_kwh - state.current_soc_kwh
                         
                         if energy_needed > 0:
@@ -219,7 +355,11 @@ class ChargeOptimizer:
                     
                     # Available capacity = site capacity - forecasted demand
                     available_capacity = site_capacity_kw - site_demand_kw
-                    
+
+                    model.constraint(
+                        total_charging <= max(0.0, available_capacity)
+                    )
+
                     if available_capacity > 0:
                         model.constraint(total_charging <= available_capacity)
                 
@@ -259,14 +399,19 @@ class ChargeOptimizer:
                         continue
                     
                     for t_idx in range(n_slots):
-                        if not availability.availability_matrix[t_idx]:
-                            # Vehicle unavailable - no charging
+                        if (
+                            not availability
+                            or t_idx >= len(availability.availability_matrix)
+                            or not availability.availability_matrix[t_idx]
+                        ):
                             model.constraint(charge_power[t_idx][v_idx] == 0)
+
                 
                 # ===== SOLVE =====
                 
                 logger.info(f"Solving optimization (time limit: {self.time_limit}s)...")
                 
+                model.close()  # Required: Hexaly only allows solve() when model is closed
                 optimizer.param.time_limit = self.time_limit
                 optimizer.solve()
                 
@@ -289,13 +434,15 @@ class ChargeOptimizer:
                     if not state:
                         continue
                     
-                    # Calculate target energy
+                    # Calculate target energy (respect minimum SOC)
+                    min_soc_kwh = (min_soc_percent / 100.0) * state.battery_capacity_kwh
                     if requirements:
-                        target_energy_kwh = (requirements[-1].cumulative_energy_kwh + 
-                                           state.current_soc_kwh)
+                        route_target = (requirements[-1].cumulative_energy_kwh +
+                                        state.current_soc_kwh)
+                        target_energy_kwh = max(route_target, min_soc_kwh)
                     else:
-                        target_energy_kwh = ((target_soc_percent / 100.0) * 
-                                           state.battery_capacity_kwh)
+                        effective_target = max(target_soc_percent, min_soc_percent)
+                        target_energy_kwh = (effective_target / 100.0) * state.battery_capacity_kwh
                     
                     # Extract charge slots
                     charge_slots = []
@@ -353,7 +500,8 @@ class ChargeOptimizer:
             # Fall back to greedy
             return self._greedy_fallback(
                 schedule_id, vehicles, vehicle_states, energy_requirements,
-                availability_matrices, time_slots, price_data, target_soc_percent
+                availability_matrices, time_slots, price_data, target_soc_percent,
+                min_soc_percent
             )
     
     def _find_time_slot_index(self, target_time: datetime, 
@@ -373,13 +521,16 @@ class ChargeOptimizer:
         availability_matrices: Dict[int, VehicleAvailability],
         time_slots: List[datetime],
         price_data: Dict[datetime, Tuple[float, bool]],
-        target_soc_percent: float
+        target_soc_percent: float,
+        min_soc_percent: Optional[float] = None
     ) -> Dict:
         """
         Greedy fallback algorithm when Hexaly unavailable.
         
         Charges each vehicle during available low-cost periods.
         """
+        if min_soc_percent is None:
+            min_soc_percent = DEFAULT_MIN_SOC_PERCENT
         logger.warning("Using greedy fallback algorithm")
         
         vehicle_schedules = []
@@ -394,13 +545,15 @@ class ChargeOptimizer:
             requirements = energy_requirements.get(vehicle.vehicle_id, [])
             availability = availability_matrices.get(vehicle.vehicle_id)
             
-            # Calculate target energy
+            # Calculate target energy (at least min_soc_percent)
+            min_soc_kwh = (min_soc_percent / 100.0) * state.battery_capacity_kwh
             if requirements:
-                target_energy_kwh = (requirements[-1].cumulative_energy_kwh + 
-                                   state.current_soc_kwh)
+                route_target = (requirements[-1].cumulative_energy_kwh +
+                                state.current_soc_kwh)
+                target_energy_kwh = max(route_target, min_soc_kwh)
             else:
-                target_energy_kwh = ((target_soc_percent / 100.0) * 
-                                   state.battery_capacity_kwh)
+                effective_target = max(target_soc_percent, min_soc_percent)
+                target_energy_kwh = (effective_target / 100.0) * state.battery_capacity_kwh
             
             energy_needed = target_energy_kwh - state.current_soc_kwh
             

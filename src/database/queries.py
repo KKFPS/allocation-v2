@@ -108,6 +108,13 @@ class Queries:
         FROM latest_charges
     """
     
+    # Site Queries
+    GET_SITE_ASC = """
+        SELECT "ASC"
+        FROM t_site
+        WHERE site_id = %s
+    """
+
     # Charger Queries
     GET_SITE_CHARGERS = """
         SELECT charger_id, site_id, max_power, dc_flag
@@ -167,35 +174,25 @@ class Queries:
     
     # ===== SCHEDULER QUERIES =====
     
-    # Scheduler Configuration Queries
+    # Scheduler Configuration Queries (t_scheduler schema)
     CREATE_SCHEDULER = """
         INSERT INTO t_scheduler (
-            device_id, schedule_type, status, run_datetime,
-            planning_window_hours, route_energy_safety_factor,
-            min_departure_buffer_minutes, back_to_back_threshold_minutes,
-            target_soc_percent, agreed_site_capacity_kva,
-            power_factor, site_usage_factor, max_fast_chargers,
-            time_limit_seconds, created_date_time
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            device_id, scheduler_type, status, latest_schedule
+        ) VALUES (%s, %s, %s, %s)
         RETURNING schedule_id
     """
     
     GET_SCHEDULER_CONFIG = """
         SELECT 
-            schedule_id, device_id as site_id, schedule_type, status, run_datetime,
-            planning_window_hours, route_energy_safety_factor,
-            min_departure_buffer_minutes, back_to_back_threshold_minutes,
-            target_soc_percent, battery_factor, agreed_site_capacity_kva,
-            power_factor, site_usage_factor, max_fast_chargers,
-            time_limit_seconds, triad_penalty_factor, synthetic_time_price_factor,
-            created_date_time, actual_planning_window_hours
+            schedule_id, device_id, scheduler_type, status,
+            profile_end, created_datetime
         FROM t_scheduler
         WHERE schedule_id = %s
     """
     
     UPDATE_SCHEDULER_STATUS = """
         UPDATE t_scheduler
-        SET status = %s, actual_planning_window_hours = %s
+        SET status = %s, modified_datetime = now()
         WHERE schedule_id = %s
     """
     
@@ -265,7 +262,7 @@ class Queries:
     GET_FORECAST_DATA = """
         SELECT 
             forecasted_date_time,
-            forecasted_energy_consumption_kw
+            forecasted_consumption
         FROM t_site_energy_forecast_history
         WHERE site_id = %s
             AND forecasted_date_time BETWEEN %s AND %s
@@ -275,21 +272,20 @@ class Queries:
     GET_PRICE_DATA = """
         SELECT 
             date_time,
-            electricity_price_gbp_kwh,
-            is_triad_period
+            electricty_price_fixed,
+            triad
         FROM t_multisite_electricity_price
         WHERE date_time BETWEEN %s AND %s
         ORDER BY date_time ASC
     """
     
-    # Charge Schedule Results
+    # Charge Schedule Results (t_charge_schedule schema)
     INSERT_CHARGE_SCHEDULE = """
         INSERT INTO t_charge_schedule (
-            schedule_id, vehicle_id, time_slot, charge_power_kw,
-            cumulative_energy_kwh, electricity_price, site_demand_kw,
-            is_triad_period, charger_id, charger_type,
-            created_date_time
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            schedule_id, vehicle_id, charge_start_date_time, charge_power,
+            power_unit_id, charge_profile_flag, connector_id,
+            created_date_time, capacity_line, opt_level
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     
     DELETE_CHARGE_SCHEDULE_BY_SCHEDULE_ID = """
@@ -348,12 +344,45 @@ class Queries:
         LEFT JOIN t_charger c ON vc.charger_id = c.charger_id
         WHERE v.vehicle_id = %s
     """
+
+    # Vehicle state for scheduling with t_vsm AS_OF a given timestamp (e.g. current_time from test)
+    GET_VEHICLE_CHARGE_STATE_AS_OF = """
+        SELECT 
+            v.vehicle_id,
+            v.battery_capacity,
+            v.charge_power_ac,
+            v.charge_power_dc,
+            v.efficiency_kwh_mile,
+            vsm.estimated_soc,
+            vsm.status,
+            vsm.route_id as current_route_id,
+            vsm.return_eta,
+            vsm.return_soc,
+            vc.charger_id,
+            c.dc_flag as is_dc_charger
+        FROM t_vehicle v
+        LEFT JOIN t_vsm vsm ON v.vehicle_id = vsm.vehicle_id
+            AND vsm.date_time = (
+                SELECT MAX(date_time)
+                FROM t_vsm
+                WHERE vehicle_id = v.vehicle_id
+                  AND date_time <= %s
+            )
+        LEFT JOIN t_vehicle_charge vc ON v.vehicle_id = vc.vehicle_id
+            AND vc.start_date_time = (
+                SELECT MAX(start_date_time)
+                FROM t_vehicle_charge
+                WHERE vehicle_id = v.vehicle_id
+            )
+        LEFT JOIN t_charger c ON vc.charger_id = c.charger_id
+        WHERE v.vehicle_id = %s
+    """
     
     # Stale Schedule Detection
     GET_STALE_SCHEDULES = """
-        SELECT schedule_id, device_id as site_id, created_date_time
+        SELECT schedule_id, device_id, created_datetime
         FROM t_scheduler
         WHERE status = 'completed'
-            AND created_date_time < NOW() - INTERVAL '2 hours'
-        ORDER BY created_date_time DESC
+            AND created_datetime < NOW() - INTERVAL '2 hours'
+        ORDER BY created_datetime DESC
     """

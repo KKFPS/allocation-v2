@@ -12,10 +12,10 @@ def setup_logging():
         format=log_format,
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler('allocation_system.log')
+            logging.FileHandler('optimizer_system_v2.log')
         ]
     )
     
-    return logging.getLogger('allocation_system')
+    return logging.getLogger('optimizer_system_v2')
 
 logger = setup_logging()

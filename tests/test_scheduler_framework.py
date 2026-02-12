@@ -74,20 +74,20 @@ class SchedulerTestFramework:
                 'current_time': current_time.isoformat(),
                 'route_source_mode': route_source_mode.value if route_source_mode else 'default',
                 'schedule_id': result.schedule_id,
-                'status': result.status,
+                'status': result.optimization_status,
                 'total_cost': result.total_cost,
                 'total_energy_kwh': result.total_energy_kwh,
                 'vehicles_scheduled': len(result.vehicle_schedules),
                 'vehicles_with_routes': sum(1 for v in result.vehicle_schedules if v.has_routes),
                 'vehicles_without_routes': sum(1 for v in result.vehicle_schedules if not v.has_routes),
-                'planning_window_hours': result.planning_window_hours,
+                'planning_window_hours': result.actual_planning_window_hours,
                 'planning_start': result.planning_start.isoformat(),
                 'planning_end': result.planning_end.isoformat(),
                 'execution_time_seconds': execution_time,
                 'solve_time_seconds': result.solve_time_seconds,
                 'optimization_status': result.optimization_status,
                 'total_charge_slots': sum(len(v.charge_slots) for v in result.vehicle_schedules),
-                'success': result.status == 'completed'
+                'success': result.optimization_status == 'completed'
             }
             
             # Add vehicle details

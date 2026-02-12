@@ -35,7 +35,11 @@ class SchedulerController:
         
         # Connect to database
         db.connect()
-    
+
+    def close(self) -> None:
+        """Release resources (e.g. database connection)."""
+        db.close()
+
     def run_scheduling(self, current_time: Optional[datetime] = None,
                       route_source_mode: Optional[RouteSourceMode] = None) -> ChargeScheduleResult:
         """
@@ -90,8 +94,8 @@ class SchedulerController:
             vehicles = self._load_vehicles()
             logger.info(f"Loaded {len(vehicles)} vehicles for scheduling")
             
-            # Load vehicle charge states
-            vehicle_states = self._load_vehicle_states(vehicles)
+            # Load vehicle charge states (t_vsm AS_OF current_time for reproducible tests)
+            vehicle_states = self._load_vehicle_states(vehicles, as_of=current_time)
             
             # Load routes and calculate energy requirements
             vehicle_routes = self._load_vehicle_routes(vehicles, planning_start, planning_end)
@@ -109,7 +113,18 @@ class SchedulerController:
             
             # Build time slots (30-minute intervals)
             time_slots = self._build_time_slots(planning_start, planning_end)
-            
+            time_slot_hours = (planning_end - planning_start).total_seconds() / 3600.0
+            logger.info(
+                "[TIME SLOTS] planning window slots: count=%s, start=%s, end=%s (%.1fh); "
+                "forecast_keys=%s, price_keys=%s",
+                len(time_slots),
+                time_slots[0].isoformat() if time_slots else None,
+                time_slots[-1].isoformat() if time_slots else None,
+                time_slot_hours,
+                len(forecast_data),
+                len(price_data),
+            )
+
             # Run optimization
             logger.info(f"Starting optimization with {len(vehicles)} vehicles, "
                        f"{sum(len(routes) for routes in vehicle_routes.values())} total routes")
@@ -174,30 +189,27 @@ class SchedulerController:
             if not row:
                 raise ValueError(f"Schedule ID {self.schedule_id} not found")
             
+            # t_scheduler columns: schedule_id, device_id, scheduler_type, status, profile_end, created_datetime
             config = SchedulerConfig(
-                schedule_id=row[0],
-                site_id=row[1],
-                schedule_type=row[2],
-                status=row[3],
-                run_datetime=row[4],
-                planning_window_hours=row[5] or 18.0,
-                route_energy_safety_factor=row[6] or 1.15,
-                min_departure_buffer_minutes=row[7] or 60,
-                back_to_back_threshold_minutes=row[8] or 90,
-                target_soc_percent=row[9] or 95.0,
-                battery_factor=row[10] or 1.0,
-                agreed_site_capacity_kva=row[11],
-                power_factor=row[12] or 0.85,
-                site_usage_factor=row[13] or 0.90,
-                max_fast_chargers=row[14] or 0,
-                time_limit_seconds=row[15] or 300,
-                triad_penalty_factor=row[16] or 100.0,
-                synthetic_time_price_factor=row[17] or 0.01,
-                created_date_time=row[18],
-                actual_planning_window_hours=row[19]
+                schedule_id=row["schedule_id"],
+                site_id=row["device_id"],
+                schedule_type=row["scheduler_type"],
+                status=row["status"],
+                run_datetime=row["created_datetime"],
+                created_date_time=row["created_datetime"],
+                # planning/optimisation params use SchedulerConfig defaults (not in t_scheduler)
             )
-            
             self.site_id = config.site_id
+
+            # Load site capacity (Agreed Site Capacity, kVA) from t_site."ASC"
+            cur.execute(Queries.GET_SITE_ASC, (config.site_id,))
+            asc_row = cur.fetchone()
+            if asc_row and asc_row.get("ASC") is not None:
+                config.agreed_site_capacity_kva = float(asc_row["ASC"])
+                logger.debug(f"Loaded site capacity from t_site: ASC={config.agreed_site_capacity_kva} kVA")
+            else:
+                logger.warning(f"No t_site.\"ASC\" for site_id={config.site_id}; site_capacity_kw will be 0")
+
             return config
     
     def _create_scheduler_config(self, current_time: datetime) -> SchedulerConfig:
@@ -212,29 +224,27 @@ class SchedulerController:
             run_datetime=current_time,
             created_date_time=current_time
         )
-        
-        # Insert into database
+
+        # Load site capacity from t_site."ASC" and insert into t_scheduler
         with db.get_cursor() as cur:
+            cur.execute(Queries.GET_SITE_ASC, (self.site_id,))
+            asc_row = cur.fetchone()
+            if asc_row and asc_row.get("ASC") is not None:
+                config.agreed_site_capacity_kva = float(asc_row["ASC"])
+                logger.debug(f"Loaded site capacity from t_site: ASC={config.agreed_site_capacity_kva} kVA")
+            else:
+                logger.warning(f"No t_site.\"ASC\" for site_id={self.site_id}; site_capacity_kw will be 0")
+
             cur.execute(Queries.CREATE_SCHEDULER, (
                 config.site_id,
                 config.schedule_type,
                 config.status,
-                config.run_datetime,
-                config.planning_window_hours,
-                config.route_energy_safety_factor,
-                config.min_departure_buffer_minutes,
-                config.back_to_back_threshold_minutes,
-                config.target_soc_percent,
-                config.agreed_site_capacity_kva,
-                config.power_factor,
-                config.site_usage_factor,
-                config.max_fast_chargers,
-                config.time_limit_seconds,
-                config.created_date_time
+                True,  # latest_schedule
             ))
-            
-            config.schedule_id = cur.fetchone()[0]
-            db.commit()
+            row = cur.fetchone()
+            config.schedule_id = row["schedule_id"] if row else None
+
+            logger.info(f"Created new scheduler config - Schedule ID: {config.schedule_id}")
         
         logger.info(f"Created new scheduler config - Schedule ID: {config.schedule_id}")
         return config
@@ -243,23 +253,50 @@ class SchedulerController:
         """
         Calculate effective planning window based on data availability.
         
+        planning_end is capped by the earliest of: target end (start + 18h),
+        max forecast timestamp in DB, and max price timestamp in DB. If forecast
+        or price data only extend ~4 hours, the window shrinks to that horizon.
+        
         Returns:
             Tuple of (start_time, end_time, actual_hours)
         """
         planning_start = current_time
         planning_target_end = current_time + timedelta(hours=self.config.planning_window_hours)
         
-        # Check forecast horizon
+        # Check forecast and price horizons (latest timestamp available in DB)
         with db.get_cursor() as cur:
             cur.execute(Queries.GET_FORECAST_HORIZON, (self.config.site_id,))
             forecast_row = cur.fetchone()
-            max_forecast_time = forecast_row[0] if forecast_row else None
-            
+            max_forecast_time = forecast_row["max_forecast_time"] if forecast_row else None
+
             cur.execute(Queries.GET_PRICE_HORIZON)
             price_row = cur.fetchone()
-            max_price_time = price_row[0] if price_row else None
-        
-        # Calculate effective end time
+            max_price_time = price_row["max_price_time"] if price_row else None
+
+        # Log data horizons (hours from planning_start) to diagnose short windows
+        def _hours_from(t: datetime, base: datetime) -> Optional[float]:
+            if t is None:
+                return None
+            return (t - base).total_seconds() / 3600.0
+
+        forecast_hours = _hours_from(max_forecast_time, planning_start) if max_forecast_time else None
+        price_hours = _hours_from(max_price_time, planning_start) if max_price_time else None
+        target_hours = self.config.planning_window_hours
+
+        logger.info(
+            "[PLANNING WINDOW] planning_start=%s | target_end=%s (%.1fh) | "
+            "forecast_horizon: max_time=%s (%.1fh from start) | "
+            "price_horizon: max_time=%s (%.1fh from start)",
+            planning_start.isoformat(),
+            planning_target_end.isoformat(),
+            target_hours,
+            max_forecast_time.isoformat() if max_forecast_time else None,
+            forecast_hours if forecast_hours is not None else float("nan"),
+            max_price_time.isoformat() if max_price_time else None,
+            price_hours if price_hours is not None else float("nan"),
+        )
+
+        # Effective end = earliest of target, forecast horizon, price horizon
         constraints = [planning_target_end]
         if max_forecast_time:
             constraints.append(max_forecast_time)
@@ -268,14 +305,29 @@ class SchedulerController:
         
         planning_end = min(constraints)
         actual_hours = (planning_end - planning_start).total_seconds() / 3600.0
+
+        # Identify which constraint limited the window
+        if planning_end == planning_target_end:
+            limiting = "target (no horizon limit)"
+        elif max_forecast_time and planning_end == max_forecast_time:
+            limiting = "forecast horizon (DB has no forecast beyond this time)"
+        elif max_price_time and planning_end == max_price_time:
+            limiting = "price horizon (DB has no price data beyond this time)"
+        else:
+            limiting = "unknown"
+        logger.info(
+            "[PLANNING WINDOW] effective planning_end=%s | actual_hours=%.1f | limiting=%s",
+            planning_end.isoformat(), actual_hours, limiting,
+        )
         
-        # Log warnings if window reduced
         if actual_hours < self.config.planning_window_hours:
-            logger.warning(f"Planning window reduced due to data availability: "
-                          f"Configured: {self.config.planning_window_hours:.1f}h, "
-                          f"Actual: {actual_hours:.1f}h")
-            logger.warning(f"Forecast available until: {max_forecast_time}, "
-                          f"Price available until: {max_price_time}")
+            logger.warning(
+                "Planning window reduced due to data availability: "
+                "configured=%.1fh, actual=%.1fh. "
+                "Extend t_site_energy_forecast_history and/or t_multisite_electricity_price "
+                "to cover full window for 18h schedules.",
+                self.config.planning_window_hours, actual_hours,
+            )
         
         return planning_start, planning_end, actual_hours
     
@@ -285,8 +337,8 @@ class SchedulerController:
             cur.execute(Queries.GET_FLEET_EFFICIENCY, (self.config.site_id,))
             row = cur.fetchone()
             
-            vehicle_count = row[0] if row else 0
-            fleet_avg = row[1] if row and row[1] else None
+            vehicle_count = row["vehicle_count"] if row else 0
+            fleet_avg = row["fleet_avg_efficiency"] if row and row.get("fleet_avg_efficiency") else None
             
             if fleet_avg:
                 self.fleet_avg_efficiency = fleet_avg
@@ -301,64 +353,73 @@ class SchedulerController:
         vehicles = []
         
         with db.get_cursor() as cur:
-            cur.execute(Queries.GET_ALL_VEHICLES_FOR_SCHEDULING, (self.config.site_id,))
+            cur.execute(Queries.GET_ACTIVE_VEHICLES, (self.config.site_id,))
             rows = cur.fetchall()
             
             for row in rows:
                 vehicle = Vehicle(
-                    vehicle_id=row[0],
-                    site_id=row[1],
-                    active=row[2],
-                    VOR=row[3],
-                    charge_power_ac=row[4] or 11.0,
-                    charge_power_dc=row[5] or 50.0,
-                    battery_capacity=row[6] or 80.0,
-                    efficiency_kwh_mile=row[7],
-                    telematic_label=row[8]
+                    vehicle_id=row["vehicle_id"],
+                    site_id=row["site_id"],
+                    active=row["active"],
+                    VOR=row["VOR"],
+                    charge_power_ac=row["charge_power_ac"] or 11.0,
+                    charge_power_dc=row["charge_power_dc"] or 50.0,
+                    battery_capacity=row["battery_capacity"] or 80.0,
+                    efficiency_kwh_mile=row["efficiency_kwh_mile"],
+                    telematic_label=row["telematic_label"]
                 )
                 
                 vehicles.append(vehicle)
         
         return vehicles
     
-    def _load_vehicle_states(self, vehicles: List[Vehicle]) -> Dict[int, VehicleChargeState]:
-        """Load current charge state for all vehicles."""
+    def _load_vehicle_states(
+        self, vehicles: List[Vehicle], as_of: Optional[datetime] = None
+    ) -> Dict[int, VehicleChargeState]:
+        """Load charge state for all vehicles, optionally AS_OF a given time (e.g. current_time from tests)."""
         states = {}
-        
+        use_as_of = as_of is not None
+
         for vehicle in vehicles:
             with db.get_cursor() as cur:
-                cur.execute(Queries.GET_VEHICLE_CHARGE_STATE, (vehicle.vehicle_id,))
+                if use_as_of:
+                    cur.execute(
+                        Queries.GET_VEHICLE_CHARGE_STATE_AS_OF,
+                        (as_of, vehicle.vehicle_id),
+                    )
+                else:
+                    cur.execute(Queries.GET_VEHICLE_CHARGE_STATE, (vehicle.vehicle_id,))
                 row = cur.fetchone()
                 
                 if not row:
                     logger.warning(f"No state data for vehicle {vehicle.vehicle_id}")
                     continue
                 
-                estimated_soc = row[5] or 50.0  # Default to 50% if unknown
-                battery_capacity = row[1] or 80.0
+                estimated_soc = row["estimated_soc"] or 50.0  # Default to 50% if unknown
+                battery_capacity = row["battery_capacity"] or 80.0
                 current_soc_kwh = (estimated_soc / 100.0) * battery_capacity
-                
+
                 # Use vehicle-specific or fleet average efficiency
-                efficiency = row[4] or self.fleet_avg_efficiency
-                if not row[4]:
+                efficiency = row["efficiency_kwh_mile"] or self.fleet_avg_efficiency
+                if not row.get("efficiency_kwh_mile"):
                     logger.warning(f"Vehicle {vehicle.vehicle_id}: Using fleet average efficiency "
                                  f"{self.fleet_avg_efficiency:.3f} kWh/mile")
-                
+
                 state = VehicleChargeState(
                     vehicle_id=vehicle.vehicle_id,
                     current_soc_percent=estimated_soc,
                     current_soc_kwh=current_soc_kwh,
                     battery_capacity_kwh=battery_capacity,
-                    is_connected=row[10] is not None,  # Has charger_id
-                    charger_id=row[10],
-                    charger_type='DC' if row[11] else 'AC',
-                    ac_charge_rate_kw=row[2] or 11.0,
-                    dc_charge_rate_kw=row[3] or 50.0,
+                    is_connected=row["charger_id"] is not None,
+                    charger_id=row["charger_id"],
+                    charger_type='DC' if row["is_dc_charger"] else 'AC',
+                    ac_charge_rate_kw=row["charge_power_ac"] or 11.0,
+                    dc_charge_rate_kw=row["charge_power_dc"] or 50.0,
                     efficiency_kwh_mile=efficiency,
-                    status=row[6],
-                    current_route_id=row[7],
-                    return_eta=row[8],
-                    return_soc_percent=row[9]
+                    status=row["status"],
+                    current_route_id=row["current_route_id"],
+                    return_eta=row["return_eta"],
+                    return_soc_percent=row["return_soc"]
                 )
                 
                 states[vehicle.vehicle_id] = state
@@ -374,13 +435,14 @@ class SchedulerController:
         """
         vehicle_routes = {v.vehicle_id: [] for v in vehicles}
         
-        # Select query based on route source mode
-        if self.config.route_source_mode == RouteSourceMode.ROUTE_PLAN_ONLY:
+        # Select query based on route source mode (ROUTE_PLAN_ONLY/ ALLOCATED_ROUTES)
+        if self.config.route_source_mode == RouteSourceMode.ALLOCATED_ROUTES:
             query = Queries.GET_ROUTES_FOR_SCHEDULING_ROUTE_PLAN
             logger.info("Using t_route_plan for vehicle-route mapping")
         else:
             query = Queries.GET_ROUTES_FOR_SCHEDULING_ALLOCATED
             logger.info("Using t_route_plan JOIN t_route_allocated for vehicle-route mapping")
+
         
         for vehicle in vehicles:
             with db.get_cursor() as cur:
@@ -389,17 +451,17 @@ class SchedulerController:
                 
                 for row in rows:
                     route = Route(
-                        route_id=row[0],
-                        site_id=row[1],
-                        vehicle_id=row[2],
-                        route_status=row[3],
-                        route_alias=row[4],
-                        plan_start_date_time=row[5],
-                        actual_start_date_time=row[6],
-                        plan_end_date_time=row[7],
-                        actual_end_date_time=row[8],
-                        plan_mileage=row[9],
-                        n_orders=row[10]
+                        route_id=row["route_id"],
+                        site_id=row["site_id"],
+                        vehicle_id=row["vehicle_id"],
+                        route_status=row["route_status"],
+                        route_alias=row["route_alias"],
+                        plan_start_date_time=row["plan_start_date_time"],
+                        actual_start_date_time=row["actual_start_date_time"],
+                        plan_end_date_time=row["plan_end_date_time"],
+                        actual_end_date_time=row["actual_end_date_time"],
+                        plan_mileage=row["plan_mileage"],
+                        n_orders=row["n_orders"]
                     )
                     
                     vehicle_routes[vehicle.vehicle_id].append(route)
@@ -495,17 +557,24 @@ class SchedulerController:
         """Calculate time-slotted availability for each vehicle."""
         # Build 30-minute time slots
         time_slots = self._build_time_slots(planning_start, planning_end)
-        
+        logger.debug(
+            f"Availability matrices: planning_window=[{planning_start} to {planning_end}], "
+            f"time_slots={len(time_slots)}, vehicles={len(vehicles)}"
+        )
         availability_matrices = {}
-        
+
         for vehicle in vehicles:
             state = vehicle_states.get(vehicle.vehicle_id)
             routes = vehicle_routes.get(vehicle.vehicle_id, [])
-            
+            logger.debug(
+                f"Vehicle {vehicle.vehicle_id}: state={state.status if state else None}, "
+                f"routes={len(routes)}, VOR={getattr(vehicle, 'VOR', False)}"
+            )
+
             # Initialize all slots as available
             availability = [True] * len(time_slots)
             unavailable_periods = []
-            
+
             # Mark VOR vehicles as completely unavailable
             if vehicle.VOR or (state and state.status == 'VOR'):
                 availability = [False] * len(time_slots)
@@ -514,36 +583,46 @@ class SchedulerController:
                     'start': planning_start,
                     'end': planning_end
                 })
+                logger.debug(f"Vehicle {vehicle.vehicle_id}: marked all {len(time_slots)} slots unavailable (VOR) {state.status} {vehicle.VOR}")
             else:
                 # Mark unavailable during on-route time (if currently on route)
                 if state and state.status == 'On-Route' and state.return_eta:
+                    on_route_slots = 0
                     for idx, slot in enumerate(time_slots):
                         if slot < state.return_eta:
                             availability[idx] = False
-                    
+                            on_route_slots += 1
                     unavailable_periods.append({
                         'reason': 'Currently on route',
                         'start': planning_start,
                         'end': state.return_eta
                     })
-                
+                    logger.debug(
+                        f"Vehicle {vehicle.vehicle_id}: On-Route until {state.return_eta}, "
+                        f"{on_route_slots} slots unavailable"
+                    )
+
                 # Mark unavailable during planned routes
                 buffer_delta = timedelta(minutes=self.config.min_departure_buffer_minutes)
                 
                 for route in routes:
                     unavailable_start = route.plan_start_date_time - buffer_delta
                     unavailable_end = route.plan_end_date_time
-                    
+                    route_slots_marked = 0
                     for idx, slot in enumerate(time_slots):
                         if unavailable_start <= slot < unavailable_end:
                             availability[idx] = False
-                    
+                            route_slots_marked += 1
                     unavailable_periods.append({
                         'reason': f'Route {route.route_id}',
                         'start': unavailable_start,
                         'end': unavailable_end
                     })
-            
+                    logger.debug(
+                        f"Vehicle {vehicle.vehicle_id}: Route {route.route_id} "
+                        f"[{unavailable_start} to {unavailable_end}] -> {route_slots_marked} slots unavailable"
+                    )
+
             vehicle_availability = VehicleAvailability(
                 vehicle_id=vehicle.vehicle_id,
                 time_slots=time_slots,
@@ -552,10 +631,17 @@ class SchedulerController:
             )
             
             availability_matrices[vehicle.vehicle_id] = vehicle_availability
-            
+
             available_slots = sum(availability)
-            logger.debug(f"Vehicle {vehicle.vehicle_id}: {available_slots}/{len(time_slots)} slots available")
-        
+            periods_summary = [
+                f"{p['reason']}({p['start']}–{p['end']})" for p in unavailable_periods
+            ]
+            logger.debug(
+                f"Vehicle {vehicle.vehicle_id}: {available_slots}/{len(time_slots)} slots available; "
+                f"unavailable_periods=[{', '.join(periods_summary)}]"
+            )
+
+        logger.debug(f"Availability matrices computed for {len(availability_matrices)} vehicles")
         return availability_matrices
     
     def _build_time_slots(self, start: datetime, end: datetime) -> List[datetime]:
@@ -572,29 +658,73 @@ class SchedulerController:
     def _load_forecast_data(self, start: datetime, end: datetime) -> Dict[datetime, float]:
         """Load site energy forecast data."""
         forecast_data = {}
-        
+        requested_hours = (end - start).total_seconds() / 3600.0
+
         with db.get_cursor() as cur:
             cur.execute(Queries.GET_FORECAST_DATA, (self.config.site_id, start, end))
             rows = cur.fetchall()
-            
+
             for row in rows:
-                forecast_data[row[0]] = row[1]
-        
-        logger.info(f"Loaded {len(forecast_data)} forecast data points")
+                forecast_data[row["forecasted_date_time"]] = row["forecasted_consumption"]
+
+        if forecast_data:
+            keys = sorted(forecast_data.keys())
+            actual_start, actual_end = keys[0], keys[-1]
+            actual_hours = (actual_end - actual_start).total_seconds() / 3600.0
+            logger.info(
+                "[FORECAST DATA HORIZON] requested: start=%s end=%s (%.1fh) | "
+                "loaded: count=%s, actual_start=%s, actual_end=%s (span %.1fh)",
+                start.isoformat(), end.isoformat(), requested_hours,
+                len(forecast_data), actual_start.isoformat(), actual_end.isoformat(), actual_hours,
+            )
+            if actual_hours < requested_hours - 0.5:
+                logger.warning(
+                    "[FORECAST DATA HORIZON] Loaded horizon (%.1fh) is shorter than requested (%.1fh) "
+                    "- missing slots will use 0.0 kW in optimizer",
+                    actual_hours, requested_hours,
+                )
+        else:
+            logger.warning(
+                "[FORECAST DATA HORIZON] No forecast data for site_id=%s in [%s, %s]; "
+                "optimizer will use 0.0 kW for all slots",
+                self.config.site_id, start.isoformat(), end.isoformat(),
+            )
         return forecast_data
     
     def _load_price_data(self, start: datetime, end: datetime) -> Dict[datetime, Tuple[float, bool]]:
         """Load electricity price data."""
         price_data = {}
-        
+        requested_hours = (end - start).total_seconds() / 3600.0
+
         with db.get_cursor() as cur:
             cur.execute(Queries.GET_PRICE_DATA, (start, end))
             rows = cur.fetchall()
-            
+
             for row in rows:
-                price_data[row[0]] = (row[1], row[2])  # (price, is_triad)
-        
-        logger.info(f"Loaded {len(price_data)} price data points")
+                price_data[row["date_time"]] = (row["electricty_price_fixed"], row["triad"])
+
+        if price_data:
+            keys = sorted(price_data.keys())
+            actual_start, actual_end = keys[0], keys[-1]
+            actual_hours = (actual_end - actual_start).total_seconds() / 3600.0
+            logger.info(
+                "[PRICE DATA HORIZON] requested: start=%s end=%s (%.1fh) | "
+                "loaded: count=%s, actual_start=%s, actual_end=%s (span %.1fh)",
+                start.isoformat(), end.isoformat(), requested_hours,
+                len(price_data), actual_start.isoformat(), actual_end.isoformat(), actual_hours,
+            )
+            if actual_hours < requested_hours - 0.5:
+                logger.warning(
+                    "[PRICE DATA HORIZON] Loaded horizon (%.1fh) is shorter than requested (%.1fh) "
+                    "- missing slots will use default price in optimizer",
+                    actual_hours, requested_hours,
+                )
+        else:
+            logger.warning(
+                "[PRICE DATA HORIZON] No price data in [%s, %s]; "
+                "optimizer will use default price for all slots",
+                start.isoformat(), end.isoformat(),
+            )
         return price_data
     
     def _run_optimization(
@@ -631,7 +761,8 @@ class SchedulerController:
             site_capacity_kw=self.config.site_capacity_kw,
             target_soc_percent=self.config.target_soc_percent,
             triad_penalty_factor=self.config.triad_penalty_factor,
-            synthetic_time_price_factor=self.config.synthetic_time_price_factor
+            synthetic_time_price_factor=self.config.synthetic_time_price_factor,
+            min_soc_percent=self.config.min_soc_percent
         )
         
         logger.info(f"Optimization completed: {result['status']}, "
@@ -680,52 +811,103 @@ class SchedulerController:
         result: ChargeScheduleResult,
         energy_requirements: Dict[int, List[RouteEnergyRequirement]]
     ):
-        """Persist schedule results to database."""
+        """Persist schedule results to database.
+        Each vehicle gets exactly one row per time slot in the planning window;
+        slots where the vehicle does not charge are stored with charge_power 0.
+        """
+        planning_hours = (
+            (result.planning_end - result.planning_start).total_seconds() / 3600.0
+            if result.planning_start and result.planning_end
+            else None
+        )
+        # Build full list of time slots (same 30-min grid as optimization)
+        all_time_slots = self._build_time_slots(result.planning_start, result.planning_end)
+        n_slots = len(all_time_slots)
+
+        logger.info(
+            "[t_charge_schedule] Persisting: schedule_id=%s | planning_start=%s | planning_end=%s | "
+            "planning_hours=%.1f | time_slots=%s | vehicles=%s",
+            self.schedule_id,
+            result.planning_start.isoformat() if result.planning_start else None,
+            result.planning_end.isoformat() if result.planning_end else None,
+            planning_hours or 0.0,
+            n_slots,
+            len(result.vehicle_schedules),
+        )
+
         with db.get_cursor() as cur:
             # Delete existing schedule data
             cur.execute(Queries.DELETE_CHARGE_SCHEDULE_BY_SCHEDULE_ID, (self.schedule_id,))
-            
-            # Insert charge schedule
+            deleted = cur.rowcount if getattr(cur, "rowcount", None) is not None else None
+            logger.info(
+                "[t_charge_schedule] Deleted existing rows for schedule_id=%s (rowcount=%s)",
+                self.schedule_id, deleted,
+            )
+
+            total_inserted = 0
+            # One row per (vehicle, time_slot); use 0 power where vehicle does not charge
             for vehicle_schedule in result.vehicle_schedules:
-                for slot in vehicle_schedule.charge_slots:
+                connector_id = (
+                    str(vehicle_schedule.assigned_charger_id)
+                    if vehicle_schedule.assigned_charger_id is not None
+                    else "1"
+                )
+                # Map time_slot -> charge_power_kw from optimizer output (only slots with power > 0)
+                power_by_slot = {
+                    slot.time_slot: slot.charge_power_kw
+                    for slot in (vehicle_schedule.charge_slots or [])
+                }
+                vehicle_inserted = 0
+                for slot_time in all_time_slots:
+                    power_kw = power_by_slot.get(slot_time, 0.0)
                     cur.execute(Queries.INSERT_CHARGE_SCHEDULE, (
                         self.schedule_id,
                         vehicle_schedule.vehicle_id,
-                        slot.time_slot,
-                        slot.charge_power_kw,
-                        slot.cumulative_energy_kwh,
-                        slot.electricity_price,
-                        slot.site_demand_kw,
-                        slot.is_triad_period,
-                        vehicle_schedule.assigned_charger_id,
-                        vehicle_schedule.charger_type,
-                        datetime.utcnow()
+                        slot_time,
+                        power_kw,
+                        None,  # power_unit_id
+                        True,  # charge_profile_flag
+                        connector_id,
+                        datetime.utcnow(),
+                        250,   # capacity_line
+                        None,  # opt_level
                     ))
-            
+                    vehicle_inserted += 1
+
+                total_inserted += vehicle_inserted
+                charging_slots = sum(1 for st in all_time_slots if power_by_slot.get(st, 0.0) > 0.01)
+                logger.info(
+                    "[t_charge_schedule] Inserted vehicle_id=%s | rows=%s (one per slot) | "
+                    "slots_with_charge=%s | first_slot=%s | last_slot=%s | "
+                    "total_energy_scheduled_kwh=%.2f",
+                    vehicle_schedule.vehicle_id,
+                    vehicle_inserted,
+                    charging_slots,
+                    all_time_slots[0].isoformat() if all_time_slots else None,
+                    all_time_slots[-1].isoformat() if all_time_slots else None,
+                    getattr(vehicle_schedule, "total_energy_scheduled_kwh", None) or 0.0,
+                )
+
             # Insert route checkpoints
-            for vehicle_id, requirements in energy_requirements.items():
-                for requirement in requirements:
-                    cur.execute(Queries.INSERT_ROUTE_CHECKPOINT, (
-                        self.schedule_id,
-                        vehicle_id,
-                        requirement.route_id,
-                        requirement.plan_start_date_time,
-                        requirement.cumulative_energy_kwh,
-                        requirement.route_energy_buffer_kwh,
-                        requirement.efficiency_kwh_mile,
-                        datetime.utcnow()
-                    ))
-            
-            db.commit()
-        
-        logger.info(f"Persisted schedule to database - Schedule ID: {self.schedule_id}")
+            # for vehicle_id, requirements in energy_requirements.items():
+            #     for requirement in requirements:
+            #         cur.execute(Queries.INSERT_ROUTE_CHECKPOINT, (
+            #             self.schedule_id,
+            #             vehicle_id,
+            #             requirement.route_id,
+            #             requirement.plan_start_date_time,
+            #             requirement.cumulative_energy_kwh,
+            #             requirement.route_energy_buffer_kwh,
+            #             requirement.efficiency_kwh_mile,
+            #             datetime.utcnow()
+            #         ))
+
+        logger.info(
+            "[t_charge_schedule] Persist complete: schedule_id=%s | total_rows_inserted=%s",
+            self.schedule_id, total_inserted,
+        )
     
     def _update_scheduler_status(self, status: str, actual_hours: Optional[float]):
-        """Update scheduler status."""
+        """Update scheduler status (t_scheduler has status only; actual_hours not stored)."""
         with db.get_cursor() as cur:
-            cur.execute(Queries.UPDATE_SCHEDULER_STATUS, (
-                status,
-                actual_hours,
-                self.schedule_id
-            ))
-            db.commit()
+            cur.execute(Queries.UPDATE_SCHEDULER_STATUS, (status, self.schedule_id))
