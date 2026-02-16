@@ -48,11 +48,11 @@ DEFAULT_RESERVE_VEHICLE_COUNT = 2
 DEFAULT_TURNAROUND_TIME_MINUTES = 45
 
 # Default Scheduler Parameters
-DEFAULT_PLANNING_WINDOW_HOURS = 18.0
+DEFAULT_PLANNING_WINDOW_HOURS = 24.0
 DEFAULT_ROUTE_ENERGY_SAFETY_FACTOR = 1.15
 DEFAULT_MIN_DEPARTURE_BUFFER_MINUTES = 60
 DEFAULT_BACK_TO_BACK_THRESHOLD_MINUTES = 90
-DEFAULT_TARGET_SOC_PERCENT = 95.0
+DEFAULT_TARGET_SOC_PERCENT = 75.0
 # Minimum SOC (%) that vehicles must reach when charging (configurable in code)
 DEFAULT_MIN_SOC_PERCENT = 75.0
 DEFAULT_BATTERY_FACTOR = 1.0
@@ -89,4 +89,20 @@ DEFAULT_CONSTRAINT_ENABLED = {
     'swap_minimization': True,
     'energy_optimization': True,
 }
+
+# Unified Optimizer Configuration
+# Enables combined allocation + scheduling in single model
+USE_UNIFIED_OPTIMIZER = False  # Set True to use unified optimizer
+
+# Unified optimizer weights (weighted sum objective)
+# Objective: α * allocation_score - β * scheduling_cost
+UNIFIED_ALLOCATION_WEIGHT = 1.0      # α: weight for allocation term
+UNIFIED_SCHEDULING_WEIGHT = 1.0      # β: weight for scheduling cost term
+UNIFIED_ROUTE_COUNT_WEIGHT = 1e2     # Priority weight for route coverage
+UNIFIED_SOC_SHORTFALL_PENALTY = 0.2  # Penalty per kWh shortfall from target
+
+# Unified optimizer time limits (seconds)
+UNIFIED_ALLOCATION_TIME_LIMIT = 30
+UNIFIED_SCHEDULING_TIME_LIMIT = 300
+UNIFIED_INTEGRATED_TIME_LIMIT = 330
 

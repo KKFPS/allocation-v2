@@ -16,7 +16,8 @@ class EnergyFeasibilityConstraint(BaseConstraint):
         Args:
             vehicle: Vehicle being evaluated
             route_sequence: Sequence of routes
-            **kwargs: May contain 'site_chargers' with charging infrastructure
+            **kwargs: May contain 'site_chargers' with charging infrastructure.
+            Uses vehicle.available_time as start of charge window before first route.
         
         Returns:
             Penalty if energy insufficient, 0 otherwise
@@ -31,6 +32,26 @@ class EnergyFeasibilityConstraint(BaseConstraint):
         current_energy = vehicle.available_energy_kwh or vehicle.battery_capacity
         
         logger.debug(f"    Energy check: start={current_energy:.1f} kWh, safety_margin={safety_margin_kwh} kWh")
+        
+        # Add charging between now and start of first route (continuous time)
+        first_route = route_sequence[0]
+        charge_start = vehicle.available_time
+        if charge_start is not None:
+            time_before_first = (first_route.plan_start_date_time - charge_start).total_seconds() / 3600.0
+            time_before_first = max(0.0, time_before_first)
+            if time_before_first > 0:
+                charger_max_power = None
+                site_chargers = kwargs.get("site_chargers") or []
+                if vehicle.current_charger_id is not None and site_chargers:
+                    for ch in site_chargers:
+                        if ch.get("charger_id") == vehicle.current_charger_id:
+                            charger_max_power = ch.get("max_power")
+                            break
+                charge_power = vehicle.get_charge_power(
+                    use_dc=allow_dc_charging, charger_max_power=charger_max_power
+                )
+                potential_charge = time_before_first * charge_power
+                current_energy = min(current_energy + potential_charge, vehicle.battery_capacity)
         
         for route in route_sequence:
             # Calculate energy required for this route

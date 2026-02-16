@@ -19,6 +19,7 @@ class Route:
     vehicle_id: Optional[int] = None
     actual_start_date_time: Optional[datetime] = None
     actual_end_date_time: Optional[datetime] = None
+    energy_kwh: Optional[float] = None  # From scheduling/allocated route data when available
     
     @property
     def duration_hours(self) -> float:

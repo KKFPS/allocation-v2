@@ -1,0 +1,207 @@
+% Unified Optimizer Model
+% Vehicle allocation and charge scheduling (Hexaly-based)
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage[margin=2.5cm]{geometry}
+
+\title{Unified Optimizer Model\\
+\large Vehicle--Route Allocation and Charge Scheduling}
+\author{Allocation-v2}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+The unified optimizer combines \textbf{vehicle--route allocation} and \textbf{charge scheduling} in a single optimization model. It supports three modes:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Allocation only:} Select at most one sequence per vehicle so that as many routes as possible are covered, then maximize total sequence score.
+  \item \textbf{Scheduling only:} For pre-allocated routes, decide charging power per vehicle per 30-minute slot to meet route energy (hard) and minimize electricity cost and target-SOC shortfall (soft).
+  \item \textbf{Integrated:} Joint optimization with a weighted-sum objective: maximize allocation score minus charging cost (and shortfall penalty).
+\end{itemize}
+
+The implementation uses Hexaly (or a greedy fallback when Hexaly is inactive). Slot length is fixed at 0.5\,h, so energy in slot $t$ for vehicle $v$ is $\text{power}_{t,v} \times 0.5$\,kWh.
+
+\section{Sets and Indices}
+
+\begin{itemize}[noitemsep]
+  \item $i \in \mathcal{I}$: sequence index (each sequence = one vehicle + ordered list of routes + cost).
+  \item $r \in \mathcal{R}$: route ID (all routes in the planning window).
+  \item $v \in \mathcal{V}$: vehicle index (for scheduling).
+  \item $t \in \mathcal{T}$: time-slot index; $|\mathcal{T}| = T$; slot length $\Delta = 0.5$\,h.
+\end{itemize}
+
+\section{Parameters and Data}
+
+\subsection{Allocation}
+\begin{itemize}[noitemsep]
+  \item $\mathcal{I}_v \subseteq \mathcal{I}$: sequences that use vehicle $v$.
+  \item $\mathcal{I}_r \subseteq \mathcal{I}$: sequences that cover route $r$.
+  \item $c_i \in \mathbb{R}$: cost/score of sequence $i$ (higher is better).
+  \item $W_{\text{route}} \in \mathbb{R}_+$: weight for route coverage (default $10^2$); one extra route dominates score differences.
+\end{itemize}
+
+\subsection{Scheduling}
+\begin{itemize}[noitemsep]
+  \item $\overline{P}_v$: max charging power (kW) for vehicle $v$ (AC charge rate).
+  \item $\overline{E}_v$: max cumulative energy (kWh) that can be delivered to $v$ (battery capacity minus current SOC).
+  \item $E^{\text{req}}_{v,k}$: energy (kWh) required by vehicle $v$ by checkpoint $k$ (departure); derived from route cumulative energy and current SOC.
+  \item $\tau_{v,k}$: slot index just before departure for checkpoint $k$ of vehicle $v$ (so energy must be met by end of slot $\tau_{v,k}-1$ or equivalent).
+  \item $C^{\text{site}}$: site capacity (kW).
+  \item $d_t$: site demand forecast (kW) in slot $t$; available for charging: $\max(0, C^{\text{site}} - d_t)$.
+  \item $p_t$: electricity price in slot $t$.
+  \item $\text{triad}_t$: TRIAD penalty (e.g. 100) if slot $t$ is TRIAD, else 0.
+  \item $\sigma_t = \gamma_{\text{time}} \cdot (T - t) / T$: synthetic time price (earlier slots cheaper); $\gamma_{\text{time}} = 0.01$ default.
+  \item $\text{SOC}^{\text{targ}}_v$: target SOC (kWh) for vehicle $v$ (e.g. 75\% of capacity).
+  \item $\lambda$: penalty per kWh shortfall from target SOC (default 0.2).
+  \item $A_{t,v} \in \{0,1\}$: 1 if vehicle $v$ is available to charge in slot $t$, 0 otherwise.
+\end{itemize}
+
+\subsection{Config (weights)}
+\begin{itemize}[noitemsep]
+  \item $\alpha$: allocation score weight (default 1).
+  \item $\beta$: scheduling cost weight (default 1).
+  \item $W_{\text{route}}$: route count weight in allocation term (default $10^2$).
+\end{itemize}
+
+\section{Decision Variables}
+
+\subsection{Allocation (when allocation is active)}
+\begin{itemize}[noitemsep]
+  \item $x_i \in \{0,1\}$: 1 if sequence $i$ is selected.
+  \item $y_r \in \{0,1\}$: 1 if route $r$ is covered by at least one selected sequence.
+\end{itemize}
+
+\subsection{Scheduling (when scheduling is active)}
+\begin{itemize}[noitemsep]
+  \item $P_{t,v} \in [0, \overline{P}_v]$: charging power (kW) for vehicle $v$ in slot $t$.
+  \item $E_{t,v} \in [0, \overline{E}_v]$: cumulative energy (kWh) delivered to vehicle $v$ by end of slot $t$.
+  \item $s_v \in [0, \overline{s}_v]$: shortfall (kWh) from target SOC for vehicle $v$ (soft); $\overline{s}_v = \max(0, \text{SOC}^{\text{targ}}_v - \text{SOC}^{\text{init}}_v)$.
+\end{itemize}
+
+Energy delivered in slot $t$ for vehicle $v$ is $P_{t,v} \cdot \Delta = 0.5\, P_{t,v}$\,kWh.
+
+\section{Objectives by Mode}
+
+\subsection{Allocation only}
+Maximize route coverage (priority) plus sequence scores:
+\begin{equation}
+  \max \quad W_{\text{route}} \sum_{r \in \mathcal{R}} y_r + \sum_{i \in \mathcal{I}} c_i\, x_i.
+\end{equation}
+
+\subsection{Scheduling only}
+Minimize charging cost plus shortfall penalty:
+\begin{equation}
+  \min \quad \sum_{t,v} \big( p_t + \sigma_t + \text{triad}_t \big)\, (0.5\, P_{t,v}) + \lambda \sum_v s_v.
+\end{equation}
+
+\subsection{Integrated}
+Maximize weighted allocation term minus weighted scheduling term:
+\begin{equation}
+  \max \quad \alpha\, \Bigl( W_{\text{route}} \sum_r y_r + \sum_i c_i\, x_i \Bigr) - \beta\, \Bigl( \sum_{t,v} (p_t + \sigma_t + \text{triad}_t)\, (0.5\, P_{t,v}) + \lambda \sum_v s_v \Bigr).
+\end{equation}
+
+\section{Constraints}
+
+\subsection{Allocation constraints (when allocation is active)}
+
+\begin{enumerate}[label=(A\arabic*)]
+  \item \textbf{One sequence per vehicle:} For each vehicle $v$,
+    \begin{equation}
+      \sum_{i \in \mathcal{I}_v} x_i \le 1.
+    \end{equation}
+  \item \textbf{Each route at most once:} For each route $r$,
+    \begin{equation}
+      \sum_{i \in \mathcal{I}_r} x_i \le 1.
+    \end{equation}
+  \item \textbf{Route covered definition:} For each route $r$ with $\mathcal{I}_r \ne \emptyset$,
+    \begin{align}
+      y_r &\le \sum_{i \in \mathcal{I}_r} x_i, \\
+      \sum_{i \in \mathcal{I}_r} x_i &\le |\mathcal{I}_r|\, y_r,
+    \end{align}
+    so $y_r = 1$ iff at least one selected sequence covers $r$.
+\end{enumerate}
+
+\subsection{Scheduling constraints (when scheduling is active)}
+
+\begin{enumerate}[label=(S\arabic*)]
+  \item \textbf{Cumulative energy:} For each vehicle $v$,
+    \begin{equation}
+      E_{0,v} = 0.5\, P_{0,v}, \qquad E_{t,v} = E_{t-1,v} + 0.5\, P_{t,v} \quad (t \ge 1).
+    \end{equation}
+  \item \textbf{Route energy (hard):} For each vehicle $v$ and each checkpoint $k$ with slot index $\tau_{v,k}$ and required energy $E^{\text{req}}_{v,k}$,
+    \begin{equation}
+      E_{\tau_{v,k}-1,v} \ge E^{\text{req}}_{v,k}.
+    \end{equation}
+  \item \textbf{Site capacity:} For each slot $t$,
+    \begin{equation}
+      \sum_v P_{t,v} \le \max(0,\, C^{\text{site}} - d_t).
+    \end{equation}
+  \item \textbf{Max SOC:} For each $v$ and $t$,
+    \begin{equation}
+      E_{t,v} \le \overline{E}_v.
+    \end{equation}
+  \item \textbf{Charge rate:} For each $v$ and $t$,
+    \begin{equation}
+      P_{t,v} \le \overline{P}_v.
+    \end{equation}
+  \item \textbf{Availability:} If $A_{t,v} = 0$, then
+    \begin{equation}
+      P_{t,v} = 0.
+    \end{equation}
+  \item \textbf{Target SOC shortfall (soft):} For each $v$ with $\overline{s}_v > 0$,
+    \begin{equation}
+      s_v \ge \text{SOC}^{\text{targ}}_v - \text{SOC}^{\text{init}}_v - E_{T-1,v}.
+    \end{equation}
+    Shortfall is penalized in the objective; no hard constraint.
+\end{enumerate}
+
+\section{Summary of Default Parameters}
+
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  Symbol & Meaning & Default \\
+  \midrule
+  $W_{\text{route}}$ & Route count weight & $10^2$ \\
+  $\alpha$ & Allocation score weight & 1.0 \\
+  $\beta$ & Scheduling cost weight & 1.0 \\
+  $\lambda$ & Target SOC shortfall penalty & 0.2 \\
+  $\gamma_{\text{time}}$ & Synthetic time price factor & 0.01 \\
+  TRIAD & TRIAD penalty (when active) & 100 \\
+  Target SOC & Percentage of battery & 75\% \\
+  $\Delta$ & Slot length (hours) & 0.5 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{Time limits (seconds)}
+
+\begin{center}
+\begin{tabular}{ll}
+  \toprule
+  Mode & Time limit \\
+  \midrule
+  Allocation only & 30 \\
+  Scheduling only & 300 \\
+  Integrated & 330 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{References}
+
+\begin{itemize}[noitemsep]
+  \item Implementation: \texttt{src/optimizer/unified\_optimizer.py}
+  \item Controller: \texttt{src/controllers/unified\_controller.py}
+  \item Text reference: \texttt{docs/optimization\_models.md}
+\end{itemize}
+
+\end{document}

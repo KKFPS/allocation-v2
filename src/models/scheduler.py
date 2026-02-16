@@ -28,13 +28,13 @@ class SchedulerConfig:
     status: str = 'pending'
     
     # Planning window configuration
-    planning_window_hours: float = 18.0
+    planning_window_hours: float = 24.0
     route_energy_safety_factor: float = 1.15
     min_departure_buffer_minutes: int = 60
     back_to_back_threshold_minutes: int = 90
     
     # Target SOC configuration
-    target_soc_percent: float = 95.0
+    target_soc_percent: float = 75.0
     min_soc_percent: float = 75.0  # Minimum charge level (e.g. charge at least to 75%)
     battery_factor: float = 1.0  # Max SOC multiplier
     

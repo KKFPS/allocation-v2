@@ -34,7 +34,7 @@ class Vehicle:
     
     def is_available_for_allocation(self) -> bool:
         """Check if vehicle can be allocated."""
-        return self.active and not self.vor
+        return self.active and not self.VOR
     
     def get_available_energy(self, current_time: datetime) -> float:
         """
