@@ -10,7 +10,7 @@ from src.models.allocation import AllocationResult, RouteAllocation
 from src.models.scheduler import (
     VehicleChargeState, RouteEnergyRequirement,
     VehicleAvailability, ChargeScheduleResult, VehicleChargeSchedule,
-    ChargeSlot, RouteSourceMode
+    ChargeSlot, RouteSourceMode, ScheduleReport, VehicleScheduleReport
 )
 from src.maf.parameter_parser import parse_maf_response, get_site_parameter, get_all_constraint_configs
 from src.constraints.constraint_manager import ConstraintManager
@@ -54,7 +54,8 @@ class UnifiedController:
         current_time: Optional[datetime] = None,
         mode: str = 'integrated',
         config: Optional[UnifiedOptimizationConfig] = None,
-        persist_to_database: bool = True
+        persist_to_database: bool = True,
+        window_hours: Optional[float] = None
     ) -> Tuple[Optional[AllocationResult], Optional[ChargeScheduleResult], UnifiedOptimizationResult]:
         """
         Execute complete unified optimization workflow.
@@ -64,6 +65,7 @@ class UnifiedController:
             mode: Optimization mode ('allocation_only', 'scheduling_only', 'integrated')
             config: Optional optimization configuration
             persist_to_database: Whether to persist results to database
+            window_hours: Optional planning window length in hours (overrides site/MAF default)
         
         Returns:
             Tuple of (AllocationResult, ChargeScheduleResult, UnifiedOptimizationResult)
@@ -81,13 +83,15 @@ class UnifiedController:
         
         try:
             # Phase 1: Initialization
-            self._initialize_optimization(current_time, opt_mode)
+            self._initialize_optimization(current_time, opt_mode, window_hours_override=window_hours)
             
             # Phase 2: Load configuration from MAF
             self._load_maf_configuration()
             
             # Phase 3: Define planning window and load data
-            window_start, window_end, actual_hours = self._calculate_planning_window(current_time)
+            window_start, window_end, actual_hours = self._calculate_planning_window(
+                current_time, window_hours_override=window_hours
+            )
             
             logger.info(f"Planning window: {window_start} to {window_end} ({actual_hours:.1f} hours)")
             
@@ -191,9 +195,16 @@ class UnifiedController:
         
         return mode_map[mode_lower]
     
-    def _initialize_optimization(self, current_time: datetime, mode: OptimizationMode):
+    def _initialize_optimization(
+        self, current_time: datetime, mode: OptimizationMode,
+        window_hours_override: Optional[float] = None
+    ):
         """Initialize allocation and/or scheduling monitor records."""
-        window_hours = DEFAULT_ALLOCATION_WINDOW_HOURS
+        window_hours = (
+            window_hours_override
+            if window_hours_override is not None
+            else DEFAULT_ALLOCATION_WINDOW_HOURS
+        )
         
         # Create allocation monitor if needed
         if mode in (OptimizationMode.ALLOCATION_ONLY, OptimizationMode.INTEGRATED):
@@ -259,18 +270,24 @@ class UnifiedController:
             logger.error(f"Failed to load MAF configuration: {e}")
             self.site_config = {'parameters': {}, 'enabled_vehicles': []}
     
-    def _calculate_planning_window(self, current_time: datetime) -> Tuple[datetime, datetime, float]:
+    def _calculate_planning_window(
+        self, current_time: datetime,
+        window_hours_override: Optional[float] = None
+    ) -> Tuple[datetime, datetime, float]:
         """
         Calculate effective planning window based on data availability.
         
         Returns:
             Tuple of (start_time, end_time, actual_hours)
         """
-        window_hours = get_site_parameter(
-            self.site_config, 
-            'allocation_window_hours', 
-            DEFAULT_ALLOCATION_WINDOW_HOURS
-        )
+        if window_hours_override is not None:
+            window_hours = window_hours_override
+        else:
+            window_hours = get_site_parameter(
+                self.site_config,
+                'allocation_window_hours',
+                DEFAULT_ALLOCATION_WINDOW_HOURS
+            )
         
         planning_start = current_time
         planning_target_end = current_time + timedelta(hours=window_hours)
@@ -845,6 +862,264 @@ class UnifiedController:
         
         logger.info(f"Updated scheduler status: {status}")
     
+    def get_schedule_report(
+        self, schedule_id: int, timestamp: datetime
+    ) -> ScheduleReport:
+        """
+        Produce a read-only report for a persisted schedule.
+        
+        Args:
+            schedule_id: Schedule ID (from t_scheduler).
+            timestamp: As-of time for vehicle state and report context.
+        
+        Returns:
+            ScheduleReport with charging/allocation stats, charging time
+            before first route and between routes, end-of-plan SOC, and other details.
+        """
+        # 1. Load schedule metadata
+        config_rows = db.execute_query(
+            Queries.GET_SCHEDULER_CONFIG,
+            (schedule_id,),
+            fetch=True
+        )
+        if not config_rows:
+            raise ValueError(f"Schedule ID {schedule_id} not found")
+        row = config_rows[0]
+        site_id = row['device_id']
+        schedule_status = row.get('status')
+        
+        # 2. Load charge schedule
+        charge_rows = db.execute_query(
+            Queries.GET_CHARGE_SCHEDULE_BY_SCHEDULE_ID,
+            (schedule_id,),
+            fetch=True
+        )
+        
+        if not charge_rows:
+            return ScheduleReport(
+                schedule_id=schedule_id,
+                site_id=site_id,
+                report_timestamp=timestamp,
+                schedule_status=schedule_status,
+                notes=['No charge data for this schedule.']
+            )
+        
+        # Derive planning window and per-vehicle charge data
+        slot_duration_hours = 0.5  # 30 min
+        all_slot_times = {r['charge_start_date_time'] for r in charge_rows}
+        planning_start = min(all_slot_times)
+        planning_end = max(all_slot_times) + timedelta(minutes=30)
+        
+        # Per vehicle: list of (slot_time, charge_power_kw), total energy
+        vehicle_charge_slots: Dict[int, List[Tuple[datetime, float]]] = {}
+        vehicle_energy: Dict[int, float] = {}
+        for r in charge_rows:
+            vid = r['vehicle_id']
+            t = r['charge_start_date_time']
+            p = float(r['charge_power'] or 0)
+            if vid not in vehicle_charge_slots:
+                vehicle_charge_slots[vid] = []
+                vehicle_energy[vid] = 0.0
+            vehicle_charge_slots[vid].append((t, p))
+            vehicle_energy[vid] += p * slot_duration_hours
+        
+        total_energy_scheduled_kwh = sum(vehicle_energy.values())
+        vehicles_scheduled = len(vehicle_charge_slots)
+        
+        # 3. Load routes: prefer allocated routes (t_route_allocated) for vehicle-route mapping
+        allocated_route_rows = db.execute_query(
+            Queries.GET_ALLOCATED_ROUTES_IN_WINDOW,
+            (site_id, planning_start, planning_end),
+            fetch=True
+        )
+        route_rows = db.execute_query(
+            Queries.GET_ROUTES_IN_WINDOW,
+            (site_id, planning_start, planning_end),
+            fetch=True
+        )
+        routes = [Route(**r) for r in route_rows] if route_rows else []
+        routes_in_window = len(routes)
+
+        vehicle_routes: Dict[int, List[Route]] = {}
+        if allocated_route_rows:
+            allocated_routes = [Route(**r) for r in allocated_route_rows]
+            for route in allocated_routes:
+                vid = route.vehicle_id
+                if vid is not None:
+                    vehicle_routes.setdefault(vid, []).append(route)
+            for vid in vehicle_routes:
+                vehicle_routes[vid].sort(key=lambda r: r.plan_start_date_time)
+        else:
+            for route in routes:
+                vid = route.vehicle_id
+                if vid is not None:
+                    vehicle_routes.setdefault(vid, []).append(route)
+            for vid in vehicle_routes:
+                vehicle_routes[vid].sort(key=lambda r: r.plan_start_date_time)
+
+        vehicles_with_routes = len(vehicle_routes)
+
+        # 4. Allocation stats (count from t_route_allocated in window)
+        routes_allocated = None
+        if routes:
+            route_ids = [r.route_id for r in routes]
+            alloc_rows = db.execute_query(
+                Queries.GET_EXISTING_ALLOCATIONS,
+                (site_id, route_ids),
+                fetch=True
+            )
+            routes_allocated = len(alloc_rows) if alloc_rows else 0
+        
+        # 5. Vehicle state at timestamp (query expects as_of_time first, then vehicle_id)
+        vehicle_state: Dict[int, dict] = {}
+        for vid in vehicle_charge_slots:
+            state_rows = db.execute_query(
+                Queries.GET_VEHICLE_CHARGE_STATE_AS_OF,
+                (timestamp, vid),
+                fetch=True
+            )
+            if state_rows:
+                s = state_rows[0]
+                battery = float(s['battery_capacity'] or 0)
+                soc_pct = float(s['estimated_soc']) if s.get('estimated_soc') is not None else None
+                ac_kw = float(s['charge_power_ac'] or 0) or 11.0
+                dc_kw = float(s['charge_power_dc'] or 0) or 50.0
+                is_dc = s.get('is_dc_charger')
+                eff = s.get('efficiency_kwh_mile')
+                vehicle_state[vid] = {
+                    'battery_capacity_kwh': battery,
+                    'initial_soc_percent': soc_pct,
+                    'initial_soc_kwh': (soc_pct / 100.0 * battery) if soc_pct is not None else None,
+                    'charge_rate_kw': dc_kw if is_dc else ac_kw,
+                    'efficiency_kwh_mile': float(eff) if eff is not None else None,
+                }
+        
+        # Fleet efficiency for missing vehicle efficiency
+        fleet_eff = self.fleet_avg_efficiency
+        if fleet_eff == 0.35 and site_id:
+            try:
+                eff_rows = db.execute_query(Queries.GET_FLEET_EFFICIENCY, (site_id,), fetch=True)
+                if eff_rows and eff_rows[0].get('fleet_avg_efficiency') is not None:
+                    fleet_eff = float(eff_rows[0]['fleet_avg_efficiency'])
+            except Exception:
+                pass
+        
+        # 6 & 7. Per-vehicle: charging before first route, between routes, end SOC
+        vehicle_reports: List[VehicleScheduleReport] = []
+        total_charging_minutes_fleet = 0.0
+        
+        for vid in sorted(vehicle_charge_slots.keys()):
+            slots = vehicle_charge_slots[vid]
+            total_kwh = vehicle_energy[vid]
+            state = vehicle_state.get(vid)
+            initial_soc_kwh = state['initial_soc_kwh'] if state else None
+            initial_soc_percent = state['initial_soc_percent'] if state else None
+            battery_kwh = state['battery_capacity_kwh'] if state else None
+            charge_rate_kw = (state['charge_rate_kw'] if state else 11.0) or 11.0
+            efficiency = (state['efficiency_kwh_mile'] if state else None) or fleet_eff
+            
+            vroutes = vehicle_routes.get(vid, [])
+            
+            # Charging before first route
+            charging_minutes_before_first_route = None
+            charging_minutes_between_routes_list: List[float] = []
+            if vroutes:
+                first_start = vroutes[0].plan_start_date_time
+                energy_before = sum(
+                    p * slot_duration_hours
+                    for t, p in slots
+                    if t < first_start and p > 0
+                )
+                if charge_rate_kw > 0:
+                    charging_minutes_before_first_route = (energy_before / charge_rate_kw) * 60.0
+                else:
+                    charging_minutes_before_first_route = 0.0
+                
+                # Between routes
+                for i in range(len(vroutes) - 1):
+                    gap_start = vroutes[i].plan_end_date_time
+                    gap_end = vroutes[i + 1].plan_start_date_time
+                    energy_between = sum(
+                        p * slot_duration_hours
+                        for t, p in slots
+                        if gap_start <= t < gap_end and p > 0
+                    )
+                    if charge_rate_kw > 0:
+                        mins = (energy_between / charge_rate_kw) * 60.0
+                    else:
+                        mins = 0.0
+                    charging_minutes_between_routes_list.append(mins)
+            else:
+                # No routes: all charging is "before first route"
+                if charge_rate_kw > 0 and total_kwh > 0:
+                    charging_minutes_before_first_route = (total_kwh / charge_rate_kw) * 60.0
+                else:
+                    charging_minutes_before_first_route = 0.0
+            
+            total_between = sum(charging_minutes_between_routes_list)
+            total_charging_minutes_fleet += (charging_minutes_before_first_route or 0) + total_between
+            
+            # Route energy consumed
+            energy_required_for_routes_kwh = 0.0
+            for r in vroutes:
+                energy_required_for_routes_kwh += (r.plan_mileage or 0) * efficiency
+            
+            # End-of-plan SOC
+            estimated_final_soc_kwh = None
+            estimated_final_soc_percent = None
+            if initial_soc_kwh is not None and battery_kwh and battery_kwh > 0:
+                final_kwh = initial_soc_kwh + total_kwh - energy_required_for_routes_kwh
+                final_kwh = max(0.0, min(battery_kwh, final_kwh))
+                estimated_final_soc_kwh = final_kwh
+                estimated_final_soc_percent = 100.0 * final_kwh / battery_kwh
+            
+            allocated_route_ids = [r.route_id for r in vroutes]
+            allocated_routes = [
+                {
+                    'route_id': r.route_id,
+                    'plan_start_date_time': r.plan_start_date_time.isoformat(),
+                    'plan_end_date_time': r.plan_end_date_time.isoformat(),
+                    'plan_mileage': r.plan_mileage,
+                    'route_status': getattr(r, 'route_status', None),
+                }
+                for r in vroutes
+            ]
+            vehicle_reports.append(
+                VehicleScheduleReport(
+                    vehicle_id=vid,
+                    initial_soc_kwh=initial_soc_kwh,
+                    initial_soc_percent=initial_soc_percent,
+                    battery_capacity_kwh=battery_kwh,
+                    total_energy_scheduled_kwh=total_kwh,
+                    charging_minutes_before_first_route=charging_minutes_before_first_route,
+                    charging_minutes_between_routes=charging_minutes_between_routes_list,
+                    total_charging_minutes_between_routes=total_between,
+                    estimated_final_soc_kwh=estimated_final_soc_kwh,
+                    estimated_final_soc_percent=estimated_final_soc_percent,
+                    energy_required_for_routes_kwh=energy_required_for_routes_kwh,
+                    charge_rate_kw=charge_rate_kw,
+                    allocated_route_ids=allocated_route_ids,
+                    routes_allocated_count=len(allocated_route_ids),
+                    allocated_routes=allocated_routes,
+                )
+            )
+        
+        return ScheduleReport(
+            schedule_id=schedule_id,
+            site_id=site_id,
+            report_timestamp=timestamp,
+            planning_start=planning_start,
+            planning_end=planning_end,
+            schedule_status=schedule_status,
+            vehicles_scheduled=vehicles_scheduled,
+            total_energy_scheduled_kwh=total_energy_scheduled_kwh,
+            routes_in_window=routes_in_window,
+            routes_allocated=routes_allocated,
+            vehicles_with_routes=vehicles_with_routes,
+            total_charging_minutes_fleet=total_charging_minutes_fleet,
+            vehicle_reports=vehicle_reports,
+        )
+
     def _log_error(self, error_message: str):
         """Log error to database."""
         try:

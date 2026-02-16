@@ -36,6 +36,23 @@ class Queries:
         ORDER BY plan_start_date_time ASC
     """
     
+    # Allocated routes in window (for schedule report: use t_route_allocated)
+    GET_ALLOCATED_ROUTES_IN_WINDOW = """
+        SELECT 
+            rp.route_id, rp.site_id, ra.vehicle_id_allocated AS vehicle_id,
+            rp.route_status, rp.route_alias,
+            rp.plan_start_date_time, rp.actual_start_date_time,
+            rp.plan_end_date_time, rp.actual_end_date_time,
+            rp.plan_mileage, rp.n_orders
+        FROM t_route_plan rp
+        INNER JOIN t_route_allocated ra ON rp.route_id = ra.route_id AND rp.site_id = ra.site_id
+        WHERE ra.site_id = %s
+            AND rp.plan_start_date_time >= %s
+            AND rp.plan_start_date_time <= %s
+            AND rp.route_status IN ('N', 'A')
+        ORDER BY ra.vehicle_id_allocated, rp.plan_start_date_time ASC
+    """
+    
     # Vehicle Queries
     GET_ACTIVE_VEHICLES = '''
         SELECT 
@@ -291,6 +308,14 @@ class Queries:
     DELETE_CHARGE_SCHEDULE_BY_SCHEDULE_ID = """
         DELETE FROM t_charge_schedule
         WHERE schedule_id = %s
+    """
+    
+    GET_CHARGE_SCHEDULE_BY_SCHEDULE_ID = """
+        SELECT
+            schedule_id, vehicle_id, charge_start_date_time, charge_power
+        FROM t_charge_schedule
+        WHERE schedule_id = %s
+        ORDER BY vehicle_id, charge_start_date_time
     """
     
     # Route Checkpoints

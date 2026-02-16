@@ -3,20 +3,26 @@
 Run the server from project root:
   uvicorn src.api.unified_api:app --reload --host 0.0.0.0 --port 8000
 
-Endpoint:
-  POST /optimize/unified  - body: UnifiedOptimizationRequest (JSON), all params optional except site_id
-  GET  /health           - health check
+Endpoints:
+  POST /optimize/unified   - body: UnifiedOptimizationRequest (JSON), all params optional except site_id
+  GET  /report/schedule   - query: schedule_id, optional timestamp (as-of time for report)
+  GET  /health            - health check
 
-Example:
+Examples:
+  # Run unified optimization
   curl -X POST http://localhost:8000/optimize/unified \\
     -H "Content-Type: application/json" \\
     -d '{"site_id": 10, "test_start_time": "2026-02-16 04:30:00", "mode": "integrated"}'
+
+  # Get schedule report (timestamp optional; default is now)
+  curl "http://localhost:8000/report/schedule?schedule_id=1"
+  curl "http://localhost:8000/report/schedule?schedule_id=1&timestamp=2026-02-16T06:00:00"
 """
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.controllers.unified_controller import UnifiedController
@@ -51,6 +57,12 @@ class UnifiedOptimizationRequest(BaseModel):
         description="Optimization mode: allocation_only, scheduling_only, integrated",
     )
     persist_to_database: bool = Field(True, description="Whether to persist results to DB")
+
+    # Planning window
+    window_hours: float = Field(
+        24.0,
+        description="Total planning window in hours (default: 24). Overrides site/MAF allocation_window_hours when set.",
+    )
 
     # Optimization config overrides (fallbacks to UnifiedOptimizationConfig defaults)
     allocation_time_limit: Optional[int] = Field(None, description="Allocation phase time limit (seconds)")
@@ -211,6 +223,7 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
             mode=body.mode,
             config=config,
             persist_to_database=body.persist_to_database,
+            window_hours=body.window_hours,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -241,6 +254,47 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
             "vehicles_scheduled": schedule_result.vehicles_scheduled,
         }
     return response
+
+
+@app.get(
+    "/report/schedule",
+    response_model=Dict[str, Any],
+    summary="Get schedule report",
+    description=(
+        "Returns a read-only report for a persisted schedule: charging/allocation stats, "
+        "charging time before first route and between routes, end-of-plan SOC, and per-vehicle details. "
+        "timestamp is the as-of time for vehicle state (default: now)."
+    ),
+)
+def get_schedule_report(
+    schedule_id: int = Query(..., description="Schedule ID from t_scheduler"),
+    timestamp: Optional[str] = Query(
+        None,
+        description="As-of time for report (ISO 8601 or 'YYYY-MM-DD HH:MM:SS'). Default: now.",
+    ),
+) -> Dict[str, Any]:
+    if timestamp is None:
+        report_timestamp = datetime.now()
+    else:
+        try:
+            report_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                report_timestamp = datetime.strptime(timestamp.strip(), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid timestamp. Use ISO 8601 (e.g. 2026-02-16T06:00:00) or 'YYYY-MM-DD HH:MM:SS'.",
+                )
+
+    controller = UnifiedController(site_id=0)
+    try:
+        report = controller.get_schedule_report(schedule_id, report_timestamp)
+        return report.to_dict()
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    finally:
+        controller.close()
 
 
 @app.get("/health")

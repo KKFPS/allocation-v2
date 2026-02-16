@@ -43,8 +43,58 @@ python main.py --site-id 10
 # Scheduling only
 python scheduler_main.py --site-id 10
 
-# Integrated workflow (allocation + scheduling)
+# Integrated workflow (allocation + scheduling) - LEGACY
 python integrated_main.py --site-id 10
+
+# Unified controller (RECOMMENDED) - Single optimization model
+python unified_main.py --site-id 10 --mode integrated
+python unified_main.py --site-id 10 --mode allocation_only
+python unified_main.py --site-id 10 --mode scheduling_only
+```
+
+## Unified Controller (NEW)
+
+The unified controller provides a single optimization model that can run:
+- **Allocation only**: Maximize routes allocated with sequence scoring
+- **Scheduling only**: Minimize charging cost for pre-allocated routes
+- **Integrated**: Weighted sum of allocation score and (negative) charging cost
+
+### Key Benefits
+- Single optimization model with consistent data loading
+- All workflows from allocation and scheduler controllers are covered
+- Supports weighted objective tuning (α for allocation, β for scheduling)
+- Simplified testing and validation
+- Unified database persistence
+
+### Usage
+
+```bash
+# Integrated optimization (both allocation and scheduling)
+python unified_main.py --site-id 10 --mode integrated
+
+# Allocation only
+python unified_main.py --site-id 10 --mode allocation_only
+
+# Scheduling only (requires pre-allocated routes)
+python unified_main.py --site-id 10 --mode scheduling_only
+
+# Custom start time
+python unified_main.py --site-id 10 --mode integrated --start-time "2026-02-16 04:30:00"
+```
+
+### Testing
+
+```bash
+# Run sample test scenarios
+python tests/test_unified_optimizer.py --sample-scenarios
+
+# Run specific test
+python tests/test_unified_optimizer.py --site-id 10 --mode integrated \
+    --start-time "2026-02-16 04:30:00" --persist-to-database
+
+# Test with custom weights
+python tests/test_unified_optimizer.py --site-id 10 --mode integrated \
+    --allocation-weight 2.0 --scheduling-weight 0.5
 ```
 
 ## Quick Start
