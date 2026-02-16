@@ -57,7 +57,6 @@ The implementation uses Hexaly (or a greedy fallback when Hexaly is inactive). S
   \item $C^{\text{site}}$: site capacity (kW).
   \item $d_t$: site demand forecast (kW) in slot $t$; available for charging: $\max(0, C^{\text{site}} - d_t)$.
   \item $p_t$: electricity price in slot $t$.
-  \item $\text{triad}_t$: TRIAD penalty (e.g. 100) if slot $t$ is TRIAD, else 0.
   \item $\sigma_t = \gamma_{\text{time}} \cdot (T - t) / T$: synthetic time price (earlier slots cheaper); $\gamma_{\text{time}} = 0.01$ default.
   \item $\text{SOC}^{\text{targ}}_v$: target SOC (kWh) for vehicle $v$ (e.g. 75\% of capacity).
   \item $\lambda$: penalty per kWh shortfall from target SOC (default 0.2).
@@ -99,13 +98,13 @@ Maximize route coverage (priority) plus sequence scores:
 \subsection{Scheduling only}
 Minimize charging cost plus shortfall penalty:
 \begin{equation}
-  \min \quad \sum_{t,v} \big( p_t + \sigma_t + \text{triad}_t \big)\, (0.5\, P_{t,v}) + \lambda \sum_v s_v.
+  \min \quad \sum_{t,v} \big( p_t + \sigma_t \big)\, (0.5\, P_{t,v}) + \lambda \sum_v s_v.
 \end{equation}
 
 \subsection{Integrated}
 Maximize weighted allocation term minus weighted scheduling term:
 \begin{equation}
-  \max \quad \alpha\, \Bigl( W_{\text{route}} \sum_r y_r + \sum_i c_i\, x_i \Bigr) - \beta\, \Bigl( \sum_{t,v} (p_t + \sigma_t + \text{triad}_t)\, (0.5\, P_{t,v}) + \lambda \sum_v s_v \Bigr).
+  \max \quad \alpha\, \Bigl( W_{\text{route}} \sum_r y_r + \sum_i c_i\, x_i \Bigr) - \beta\, \Bigl( \sum_{t,v} (p_t + \sigma_t)\, (0.5\, P_{t,v}) + \lambda \sum_v s_v \Bigr).
 \end{equation}
 
 \section{Constraints}
@@ -175,7 +174,6 @@ Maximize weighted allocation term minus weighted scheduling term:
   $\beta$ & Scheduling cost weight & 1.0 \\
   $\lambda$ & Target SOC shortfall penalty & 0.2 \\
   $\gamma_{\text{time}}$ & Synthetic time price factor & 0.01 \\
-  TRIAD & TRIAD penalty (when active) & 100 \\
   Target SOC & Percentage of battery & 75\% \\
   $\Delta$ & Slot length (hours) & 0.5 \\
   \bottomrule
