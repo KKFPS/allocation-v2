@@ -10,7 +10,7 @@ Objective (weighted sum):
 
 Where:
     - route_allocation_score = W_route * routes_covered + sequence_scores
-    - charging_cost = Σ (price + triad + synthetic) * energy
+    - charging_cost = Σ (price + synthetic) * energy
     - shortfall_penalty = λ * Σ shortfall_from_target_soc
 """
 import hexaly.optimizer as hx
@@ -56,11 +56,11 @@ class UnifiedOptimizationConfig:
     # Scheduling weights
     scheduling_cost_weight: float = 1.0  # β: weight for charging cost term
     target_soc_shortfall_penalty: float = 0.2  # λ: penalty per kWh shortfall
-    triad_penalty_factor: float = 100.0
+    triad_penalty_factor: float = 100.0  # Kept for API compatibility; not used in objective
     synthetic_time_price_factor: float = 0.01
     
     # Target SOC
-    target_soc_percent: float = 95.0
+    target_soc_percent: float = 75.0
     
     # Site capacity
     site_capacity_kw: float = 0.0
@@ -427,10 +427,9 @@ class UnifiedOptimizer:
             # Build objective: minimize charging cost + shortfall penalty
             cost_terms = []
             for t_idx, slot_time in enumerate(time_slots):
-                price, is_triad = price_data.get(slot_time, (0.15, False))
+                price, _ = price_data.get(slot_time, (0.15, False))
                 synthetic_price = self.config.synthetic_time_price_factor * (n_slots - t_idx) / n_slots
-                triad_cost = self.config.triad_penalty_factor if is_triad else 0.0
-                slot_cost = price + synthetic_price + triad_cost
+                slot_cost = price + synthetic_price
                 
                 for v_idx in range(n_vehicles):
                     energy_this_slot = charge_power[t_idx][v_idx] * 0.5
@@ -604,10 +603,9 @@ class UnifiedOptimizer:
             # Scheduling term: charging cost
             cost_terms = []
             for t_idx, slot_time in enumerate(time_slots):
-                price, is_triad = price_data.get(slot_time, (0.15, False))
+                price, _ = price_data.get(slot_time, (0.15, False))
                 synthetic_price = self.config.synthetic_time_price_factor * (n_slots - t_idx) / n_slots
-                triad_cost = self.config.triad_penalty_factor if is_triad else 0.0
-                slot_cost = price + synthetic_price + triad_cost
+                slot_cost = price + synthetic_price
                 
                 for v_idx in range(n_vehicles):
                     energy_this_slot = charge_power[t_idx][v_idx] * 0.5
@@ -852,11 +850,7 @@ class UnifiedOptimizer:
                     )
                     charge_slots.append(charge_slot)
                     
-                    slot_cost = price
-                    if is_triad:
-                        slot_cost += self.config.triad_penalty_factor
-                    slot_cost += self.config.synthetic_time_price_factor * (n_slots - t_idx) / n_slots
-                    
+                    slot_cost = price + self.config.synthetic_time_price_factor * (n_slots - t_idx) / n_slots
                     total_cost += energy_kwh * slot_cost
                     total_energy += energy_kwh
             
@@ -980,7 +974,7 @@ class UnifiedOptimizer:
                     for idx, slot_time in enumerate(time_slots):
                         if availability and availability.availability_matrix[idx]:
                             price, is_triad = price_data.get(slot_time, (0.15, False))
-                            effective_price = price + (self.config.triad_penalty_factor if is_triad else 0)
+                            effective_price = price
                             slot_prices.append((effective_price, idx, slot_time, price, is_triad))
                     
                     slot_prices.sort(key=lambda x: x[0])
