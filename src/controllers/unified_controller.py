@@ -100,6 +100,12 @@ class UnifiedController:
             vehicle_states = self._load_vehicle_states(vehicles, current_time)
             
             logger.info(f"Loaded {len(vehicles)} vehicles")
+
+            # Filter out vehicles with estimated_soc = -111
+            vehicles = [v for v in vehicles if vehicle_states[v.vehicle_id].current_soc_percent != -111]
+
+            logger.info(f"Loaded {len(vehicles)} vehicles after filtering VOR vehicles (estimated_soc = -111)")
+
             
             # Phase 5: Prepare optimization inputs based on mode
             opt_inputs = self._prepare_optimization_inputs(
