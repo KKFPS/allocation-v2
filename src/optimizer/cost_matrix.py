@@ -1,11 +1,99 @@
 """Cost matrix builder for allocation optimization."""
-import numpy as np
+import csv
+import os
 from typing import List, Dict, Tuple, Optional
 from itertools import combinations
+
+import numpy as np
+
 from src.models.vehicle import Vehicle
 from src.models.route import Route
 from src.constraints.constraint_manager import ConstraintManager
 from src.utils.logging_config import logger
+
+# Set to True to dump all matrices and constraint params to a single CSV (decision vars left empty).
+DEBUG_DUMP_COST_MATRIX_CSV = True
+
+
+def _debug_dump_matrices_to_csv(
+    builder: "CostMatrixBuilder",
+    sequence_costs: np.ndarray,
+    sequences: List,
+    metadata: Dict,
+    filepath: Optional[str] = None,
+) -> None:
+    """
+    Write a single CSV with all matrices and constraint params for debugging.
+    Decision variables (selected 0/1 per sequence) are left empty.
+    Only runs when DEBUG_DUMP_COST_MATRIX_CSV is True; call from build_assignment_matrix.
+    """
+    route_ids = [r.route_id for r in builder.routes]
+    n_sequences = len(sequences)
+    n_routes = len(route_ids)
+
+    # Build same structures as optimizer: route_coverage, vehicle_to_sequences
+    route_coverage = {rid: [] for rid in route_ids}
+    vehicle_to_sequences: Dict[int, List[int]] = {}
+    for seq_idx, (vehicle_id, route_sequence, _) in enumerate(sequences):
+        vehicle_to_sequences.setdefault(vehicle_id, []).append(seq_idx)
+        for route in route_sequence:
+            if route.route_id in route_coverage:
+                route_coverage[route.route_id].append(seq_idx)
+
+    # Route-coverage matrix: row per route, column per sequence (1 if covered, 0 else)
+    route_coverage_matrix = []
+    for rid in route_ids:
+        row = [1 if seq_idx in route_coverage[rid] else 0 for seq_idx in range(n_sequences)]
+        route_coverage_matrix.append(row)
+
+    if filepath is None:
+        filepath = os.path.join(os.getcwd(), "cost_matrix_debug.csv")
+
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+
+        # --- CONSTRAINT PARAMS ---
+        w.writerow(["[CONSTRAINT_PARAMS]"])
+        w.writerow(["param", "value"])
+        w.writerow(["n_vehicles", builder.n_vehicles])
+        w.writerow(["n_routes", builder.n_routes])
+        w.writerow(["n_sequences", n_sequences])
+        w.writerow(["max_routes_per_vehicle", builder.max_routes_per_vehicle])
+        w.writerow(["total_sequences", metadata.get("total_sequences", n_sequences)])
+        w.writerow(["feasible_assignments", metadata.get("feasible_assignments", "")])
+        w.writerow([])
+
+        # --- SEQUENCE COST MATRIX (one row: header seq_0, seq_1, ... then cost values) ---
+        w.writerow(["[COST_MATRIX]"])
+        w.writerow(["seq_idx"] + [f"seq_{i}" for i in range(n_sequences)])
+        cost_row = ["cost"] + [float(sequence_costs[i]) for i in range(n_sequences)]
+        w.writerow(cost_row)
+        w.writerow([])
+
+        # --- SEQUENCE DETAILS: seq_idx, vehicle_id, route_ids, cost, selected (empty) ---
+        w.writerow(["[SEQUENCE_DETAILS]"])
+        w.writerow(["seq_idx", "vehicle_id", "route_ids", "cost", "selected"])
+        for i in range(n_sequences):
+            vehicle_id, route_sequence, cost = sequences[i]
+            route_ids_str = ";".join(r.route_id for r in route_sequence)
+            w.writerow([i, vehicle_id, route_ids_str, float(cost), ""])
+        w.writerow([])
+
+        # --- ROUTE COVERAGE MATRIX (routes x sequences) ---
+        w.writerow(["[ROUTE_COVERAGE_MATRIX]"])
+        w.writerow(["route_id"] + [f"seq_{i}" for i in range(n_sequences)])
+        for r_idx, rid in enumerate(route_ids):
+            w.writerow([rid] + route_coverage_matrix[r_idx])
+        w.writerow([])
+
+        # --- VEHICLE -> SEQUENCE INDICES ---
+        w.writerow(["[VEHICLE_TO_SEQUENCES]"])
+        w.writerow(["vehicle_id", "seq_indices"])
+        for vehicle_id in sorted(vehicle_to_sequences.keys()):
+            indices_str = ";".join(str(s) for s in vehicle_to_sequences[vehicle_id])
+            w.writerow([vehicle_id, indices_str])
+
+    logger.info(f"Debug CSV written: {filepath}")
 
 
 class CostMatrixBuilder:
@@ -159,7 +247,12 @@ class CostMatrixBuilder:
 
         logger.debug(f"  Coverage: {metadata['feasible_assignments']/metadata['total_sequences']*100:.1f}% feasible")
         logger.debug(f"{'='*60}\n")
-        
+
+        if DEBUG_DUMP_COST_MATRIX_CSV:
+            _debug_dump_matrices_to_csv(
+                self, np.array(sequence_costs), all_sequences, metadata
+            )
+
         return np.array(sequence_costs), all_sequences, metadata
     
     def get_route_sequence_map(self, sequences: List) -> Dict[int, List[str]]:
