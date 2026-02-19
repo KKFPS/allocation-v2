@@ -148,7 +148,8 @@ class AllocationController:
             )
             
             if result:
-                maf_json = result[0]['sp_get_module_params']
+                name, maf_json = result[0]['sp_get_module_params']
+                logger.info(f"MAF name: {name}")
                 site_configs = parse_maf_response(maf_json)
                 self.site_config = site_configs.get(str(self.site_id), {})
                 # logger.info(f"Loaded MAF configuration for site {self.site_id} : {self.site_config}")

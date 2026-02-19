@@ -152,6 +152,11 @@ class CostMatrixBuilder:
         logger.debug(f"\nMatrix metadata:")
         logger.debug(f"  Total sequences: {metadata['total_sequences']}")
         logger.debug(f"  Feasible assignments (cost >= 0): {metadata['feasible_assignments']}")
+
+        if metadata['feasible_assignments'] == 0:
+            logger.warning("No feasible assignments found")
+            return np.array([]), [], metadata
+
         logger.debug(f"  Coverage: {metadata['feasible_assignments']/metadata['total_sequences']*100:.1f}% feasible")
         logger.debug(f"{'='*60}\n")
         

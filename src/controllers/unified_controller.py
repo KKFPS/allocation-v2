@@ -258,9 +258,11 @@ class UnifiedController:
                 fetch=True
             )
             
+            print(f"Result: {result[0]}")
             if result:
-                json_params = result[0].get('get_module_params')
-                self.site_config = parse_maf_response(json_params, self.site_id)
+                json_params = result[0].get('sp_get_module_params')
+                # logger.info(f"MAF name for site {self.site_id}: {name}")
+                self.site_config = parse_maf_response(json_params)
                 logger.info(f"Loaded MAF config: {len(self.site_config.get('parameters', {}))} parameters")
             else:
                 logger.warning("No MAF configuration found, using defaults")
@@ -322,6 +324,9 @@ class UnifiedController:
                 f"Planning window constrained by data availability: "
                 f"requested={window_hours}h, actual={actual_hours:.1f}h"
             )
+
+        if actual_hours < window_hours/2:
+            raise ValueError(f"Planning window is less than half of the requested window: {actual_hours:.1f}h < {window_hours/2:.1f}h. Check electricity price and forecast data for the site {self.site_id}")
         
         return planning_start, planning_end, actual_hours
     

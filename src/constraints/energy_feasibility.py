@@ -32,6 +32,10 @@ class EnergyFeasibilityConstraint(BaseConstraint):
         current_energy = vehicle.available_energy_kwh or vehicle.battery_capacity
         
         logger.debug(f"    Energy check: start={current_energy:.1f} kWh, safety_margin={safety_margin_kwh} kWh")
+
+        if current_energy < 0:
+            logger.error(f"Vehicle {vehicle.vehicle_id} has negative energy: {current_energy:.1f} kWh")
+            return self.penalty
         
         # Add charging between now and start of first route (continuous time)
         first_route = route_sequence[0]
