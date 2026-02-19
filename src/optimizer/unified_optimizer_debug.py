@@ -19,7 +19,7 @@ from src.models.vehicle import Vehicle
 from src.utils.logging_config import logger
 
 # Set to True to export all matrices and constraint params to a single CSV (decision vars left empty).
-DEBUG_EXPORT_UNIFIED_MATRICES_CSV = False
+DEBUG_EXPORT_UNIFIED_MATRICES_CSV = True
 
 
 def export_unified_debug_matrices_csv(

@@ -12,7 +12,7 @@ from src.constraints.constraint_manager import ConstraintManager
 from src.utils.logging_config import logger
 
 # Set to True to dump all matrices and constraint params to a single CSV (decision vars left empty).
-DEBUG_DUMP_COST_MATRIX_CSV = True
+DEBUG_DUMP_COST_MATRIX_CSV = False
 
 
 def _debug_dump_matrices_to_csv(

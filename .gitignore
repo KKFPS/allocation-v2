@@ -44,3 +44,5 @@ test_results/
 
 .env.example
 test.log
+
+*debug*.csv
