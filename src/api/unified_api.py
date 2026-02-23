@@ -32,6 +32,7 @@ from src.optimizer.unified_optimizer import (
     UnifiedOptimizationConfig,
 )
 
+print("Unified API loaded")
 
 # --- Request body: all optional except site_id, with defaults ---
 
