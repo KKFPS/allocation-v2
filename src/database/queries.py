@@ -411,3 +411,75 @@ class Queries:
             AND created_datetime < NOW() - INTERVAL '2 hours'
         ORDER BY created_datetime DESC
     """
+
+    # ===== MICROLISE INTEGRATION QUERIES =====
+
+    # Vehicle telematics lookup: FPS vehicle_id <-> Microlise telematic_label
+    GET_VEHICLE_TELEMATICS_DICT = """
+        SELECT vehicle_id, telematic_label
+        FROM t_vehicle_telematics
+        WHERE telematic_id = 2
+    """
+
+    # Pending routes awaiting Microlise dispatch, joined to t_route_plan for route_alias
+    GET_ROUTES_FOR_DISPATCH = """
+        SELECT
+            ra.route_id,
+            ra.vehicle_id_allocated,
+            ra.site_id,
+            ra.http_response,
+            rp.route_alias
+        FROM t_route_allocated ra
+        LEFT JOIN t_route_plan rp ON ra.route_id = rp.route_id
+        WHERE ra.status = 'N'
+    """
+
+    # Persist the HTTP response code returned by the Microlise Journeys API
+    UPDATE_ROUTE_ALLOCATED_HTTP_RESPONSE = """
+        UPDATE t_route_allocated
+        SET http_response = %s
+        WHERE route_id = %s
+    """
+
+    # Set t_allocation_monitor.status after all Microlise dispatches complete
+    UPDATE_ALLOCATION_MONITOR_STATUS = """
+        UPDATE t_allocation_monitor
+        SET status = %s
+        WHERE allocation_id = %s
+    """
+
+    # Retrieve a single allocation monitor row by ID (used in compliance report)
+    GET_ALLOCATION_MONITOR_BY_ID = """
+        SELECT *
+        FROM t_allocation_monitor
+        WHERE allocation_id = %s
+    """
+
+    # All allocation monitor rows for a given calendar date (compliance report baseline)
+    GET_ALLOCATION_MONITOR_BY_DATE = """
+        SELECT *
+        FROM t_allocation_monitor
+        WHERE CAST(run_datetime AS DATE) = %s
+    """
+
+    # Historical allocation rows for a specific allocation run
+    GET_ROUTE_ALLOCATED_HISTORY_BY_IDS = """
+        SELECT *
+        FROM t_route_allocated_history
+        WHERE allocation_id = %s
+    """
+
+    # Route plan rows by a tuple of route_ids (compliance vehicle-match comparison)
+    GET_ROUTE_PLAN_BY_IDS = """
+        SELECT *
+        FROM t_route_plan
+        WHERE route_id IN %s
+    """
+
+    # Error log entries within a datetime range (unallocated-routes report)
+    GET_ERROR_LOG_FOR_DATE = """
+        SELECT *
+        FROM t_error_log
+        WHERE error_datetime >= %s
+          AND error_datetime < %s
+    """

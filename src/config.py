@@ -94,6 +94,18 @@ DEFAULT_CONSTRAINT_ENABLED = {
 # Enables combined allocation + scheduling in single model
 USE_UNIFIED_OPTIMIZER = False  # Set True to use unified optimizer
 
+# Microlise Integration Configuration
+# All values fall back to empty string when the env var is absent (integration disabled).
+MICROLISE_CLIENT_ID = os.getenv("JLP_Microlise_TokenClientId", "")
+MICROLISE_CLIENT_SECRET = os.getenv("JLP_Microlise_TokenClient_Secret", "")
+MICROLISE_TOKEN_URL = os.getenv("JLP_Microlise_Token_URL", "")
+MICROLISE_JOURNEYS_API_URL = os.getenv("JLP_Microlise_JourneysWebAPI_URL", "")
+MICROLISE_SIMULATE_RESPONSE = os.getenv("simulate_response", "True") == "True"
+MICROLISE_SEND_REPORT = os.getenv("send_report", "False") == "True"
+MICROLISE_BLOB_CONN_STRING = os.getenv("storage_account_conn_string", "")
+MICROLISE_BLOB_CONTAINER = os.getenv("allocation_blob_container", "")
+MICROLISE_BLOB_DIR = os.getenv("allocation_blob_dir", "")
+
 # Unified optimizer weights (weighted sum objective)
 # Objective: α * allocation_score - β * scheduling_cost
 UNIFIED_ALLOCATION_WEIGHT = 1.0      # α: weight for allocation term

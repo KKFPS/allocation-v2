@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.controllers.unified_controller import UnifiedController
+from src.integrations.microlise import MicroLiseClient, MicroLiseParams
 from src.optimizer.unified_optimizer import (
     OptimizationMode,
     UnifiedOptimizationConfig,
@@ -76,6 +77,62 @@ class UnifiedOptimizationRequest(BaseModel):
     synthetic_time_price_factor: Optional[float] = Field(None, description="Time preference factor")
     target_soc_percent: Optional[float] = Field(None, description="Target SOC percentage")
     site_capacity_kw: Optional[float] = Field(None, description="Site capacity in kW")
+
+    # Microlise TMS integration
+    microlise_enabled: bool = Field(
+        False,
+        description=(
+            "Enable Microlise TMS dispatch after a successful allocation. "
+            "Pushes vehicle-route assignments to the Microlise Journeys Web API."
+        ),
+    )
+    microlise_simulate: bool = Field(
+        True,
+        description=(
+            "When True (default), skip real Microlise API calls and return "
+            "synthetic 201 responses. Set to False to make live API calls."
+        ),
+    )
+    microlise_connection_type: str = Field(
+        "test",
+        description=(
+            "Connection type passed to the Microlise client: 'test' or 'prod'. "
+            "Appends ': TEST' to alert messages when 'test'."
+        ),
+    )
+    microlise_send_report: bool = Field(
+        False,
+        description=(
+            "Generate and upload the post-allocation Excel report to Azure Blob Storage. "
+            "Only runs when trigger_type='initial' and microlise_simulate=False."
+        ),
+    )
+    microlise_initial_report: bool = Field(
+        True,
+        description="Include the morning/initial allocation sheet in the report.",
+    )
+    microlise_compliance_report: bool = Field(
+        False,
+        description="Include the vehicle-match compliance sheet (yesterday vs today).",
+    )
+    microlise_unallocated_report: bool = Field(
+        False,
+        description="Include a sheet listing route aliases that had Microlise fetch errors.",
+    )
+    microlise_start_hour_allocation: int = Field(
+        6,
+        description=(
+            "Upper bound (exclusive, local hour) of the live-API window. "
+            "Used to identify the qualifying initial allocation for the compliance report."
+        ),
+    )
+    microlise_end_hour_allocation: int = Field(
+        4,
+        description=(
+            "Lower bound (inclusive, local hour) of the live-API window. "
+            "Used to identify the qualifying initial allocation for the compliance report."
+        ),
+    )
 
     class Config:
         extra = "ignore"
@@ -253,6 +310,31 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
             "total_energy_kwh": schedule_result.total_energy_kwh,
             "vehicles_scheduled": schedule_result.vehicles_scheduled,
         }
+
+    # Microlise TMS dispatch (runs after allocation is persisted to t_route_allocated)
+    if body.microlise_enabled and response.get("allocation_id") is not None:
+        microlise_params = MicroLiseParams(
+            simulate_response=body.microlise_simulate,
+            send_report=body.microlise_send_report,
+            trigger_type=body.trigger_type,
+            initial_report=body.microlise_initial_report,
+            compliance_report=body.microlise_compliance_report,
+            unallocated_report=body.microlise_unallocated_report,
+            start_hour_allocation=body.microlise_start_hour_allocation,
+            end_hour_allocation=body.microlise_end_hour_allocation,
+        )
+        microlise_client = MicroLiseClient(
+            connection_type=body.microlise_connection_type,
+        )
+        try:
+            response["microlise"] = microlise_client.run(
+                allocation_id=response["allocation_id"],
+                site_id=body.site_id,
+                params=microlise_params,
+            )
+        except Exception as exc:
+            response["microlise"] = {"success": False, "error": str(exc)}
+
     return response
 
 
