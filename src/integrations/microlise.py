@@ -272,16 +272,24 @@ class MicroLiseClient:
 
         rows = db.execute_query(Queries.GET_ROUTES_FOR_DISPATCH) or []
         logger.info(f"Loaded {len(rows)} routes for dispatch")
-        
+
+        print(f"Rows: {rows}")
+        print(f"Site ID: {site_id}")
+        print(f"HTTP response: {[r['http_response'] not in (200, 201, -1) for r in rows]}")
+
         pending = [
             r for r in rows
             if r["site_id"] == site_id
-            and r["http_response"] not in (200, 201, -1)
+            and r["http_response"] not in (200, 201) # -1 is not dispatched yet
         ]
+        
+        print(f"Pending routes: {pending}")
 
         route_aliases: List[str] = [
             str(r.get("route_alias", "")) for r in rows if r["site_id"] == site_id
         ]
+
+        print(f"Route aliases: {route_aliases}")
 
         logger.info(
             f"Dispatching {len(pending)} route(s) to Microlise "
