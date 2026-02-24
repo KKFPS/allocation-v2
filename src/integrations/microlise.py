@@ -153,6 +153,9 @@ class MicroLiseClient:
             fps_to_microlise: ``{fps_vehicle_id -> microlise_label}``
             microlise_to_fps: ``{microlise_label -> fps_vehicle_id}``
         """
+        if not db._connection or db._connection.closed:
+            db.connect()
+        
         rows = db.execute_query(Queries.GET_VEHICLE_TELEMATICS_DICT) or []
         fps_to_microlise: Dict[int, str] = {0: "X", -1: "-1"}
         microlise_to_fps: Dict[str, int] = {"X": 0, "-1": -1}
@@ -257,13 +260,19 @@ class MicroLiseClient:
             dispatch statistics and *route_aliases* is the list of route aliases
             present in the current allocation (used for the unallocated report).
         """
+        if not db._connection or db._connection.closed:
+            db.connect()
+        
         token: Optional[str] = None
         if not params.simulate_response:
             token = self.get_token()
 
+        logger.info("Getting vehicle telematics dict")
         fps_to_microlise, _ = self.get_vehicle_telematics_dict()
 
         rows = db.execute_query(Queries.GET_ROUTES_FOR_DISPATCH) or []
+        logger.info(f"Loaded {len(rows)} routes for dispatch")
+        
         pending = [
             r for r in rows
             if r["site_id"] == site_id
@@ -345,6 +354,9 @@ class MicroLiseClient:
         then returns those route numbers not already present in
         *allocation_route_aliases*.
         """
+        if not db._connection or db._connection.closed:
+            db.connect()
+        
         today_local = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         rows = (
             db.execute_query(
@@ -390,6 +402,9 @@ class MicroLiseClient:
         except ImportError:
             logger.error("pandas not installed; cannot generate compliance report")
             return None
+
+        if not db._connection or db._connection.closed:
+            db.connect()
 
         report_date = (datetime.now() - timedelta(days=1)).date()
         rows = (
@@ -488,6 +503,9 @@ class MicroLiseClient:
         except ImportError:
             logger.error("openpyxl not installed; cannot generate allocation report")
             return
+
+        if not db._connection or db._connection.closed:
+            db.connect()
 
         today_str = datetime.now().strftime("%Y_%m_%d")
         wb = Workbook()

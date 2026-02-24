@@ -20,6 +20,8 @@ Examples:
 """
 
 from datetime import datetime
+from src.utils.logging_config import logger
+import traceback
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -334,6 +336,8 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
                 params=microlise_params,
             )
         except Exception as exc:
+            traceback.print_exc()
+            logger.error(f"Error in Microlise dispatch: {exc}")
             response["microlise"] = {"success": False, "error": str(exc)}
 
     return response
