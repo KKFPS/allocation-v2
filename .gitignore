@@ -46,3 +46,5 @@ test_results/
 test.log
 
 *debug*.csv
+
+.DS_Store

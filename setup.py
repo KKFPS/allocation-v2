@@ -11,10 +11,10 @@ from setuptools import find_packages
 from setuptools import Command
 
 name = 'vehicle-route allocation model'
-version = '0.0.2'
-description = 'Vehicle Allocation'
-author = 'Sofia Taylor and Ben Fletcher'
-author_email = 'sofia.taylor@flexpowerltd.com'
+version = '1.0.0'
+description = 'FPS Optimizer V2'
+author = 'Karan Kaushik'
+author_email = 'karan.kaushik@flexpowerltd.com'
 CDIR = os.path.dirname(os.path.abspath(__file__))
 
 
