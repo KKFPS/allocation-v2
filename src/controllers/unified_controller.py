@@ -10,7 +10,7 @@ from src.models.allocation import AllocationResult, RouteAllocation
 from src.models.scheduler import (
     VehicleChargeState, RouteEnergyRequirement,
     VehicleAvailability, ChargeScheduleResult, VehicleChargeSchedule,
-    ChargeSlot, RouteSourceMode, ScheduleReport, VehicleScheduleReport
+    ChargeSlot, RouteSourceMode, ScheduleReport, VehicleScheduleReport, Charger, ChargerPowerClass
 )
 from src.maf.parameter_parser import parse_maf_response, get_site_parameter, get_all_constraint_configs
 from src.constraints.constraint_manager import ConstraintManager
@@ -442,6 +442,10 @@ class UnifiedController:
                 estimated_soc = vehicle.estimated_soc if hasattr(vehicle, 'estimated_soc') else 50.0
                 estimated_soc_kwh = (estimated_soc / 100.0) * vehicle.battery_capacity
             
+            # Check if vehicle was charging during last nighttime period
+            reference_time = as_of if as_of is not None else datetime.now()
+            last_nighttime_charger = self._get_last_nighttime_charger(vehicle.vehicle_id, reference_time)
+            
             states[vehicle.vehicle_id] = VehicleChargeState(
                 vehicle_id=vehicle.vehicle_id,
                 current_soc_percent=estimated_soc,
@@ -450,6 +454,7 @@ class UnifiedController:
                 is_connected=False,
                 ac_charge_rate_kw=vehicle.charge_power_ac,
                 dc_charge_rate_kw=vehicle.charge_power_dc,
+                last_nighttime_charger_id=last_nighttime_charger
             )
         
         return states
@@ -525,6 +530,9 @@ class UnifiedController:
             forecast_data = self._load_forecast_data(window_start, window_end)
             price_data = self._load_price_data(window_start, window_end)
             
+            # Load site chargers for allocation
+            site_chargers = self._load_site_chargers()
+            
             opt_inputs['schedule_id'] = self.schedule_id
             opt_inputs['vehicles'] = vehicles
             opt_inputs['vehicle_states'] = vehicle_states
@@ -533,6 +541,7 @@ class UnifiedController:
             opt_inputs['time_slots'] = time_slots
             opt_inputs['forecast_data'] = forecast_data
             opt_inputs['price_data'] = price_data
+            opt_inputs['site_chargers'] = site_chargers
         
         return opt_inputs
     
@@ -563,6 +572,64 @@ class UnifiedController:
         
         logger.info(f"Loaded charger locations for {len(vehicle_charger_map)}/{len(vehicles)} vehicles")
         return vehicle_charger_map
+    
+    def _load_site_chargers(self) -> List[ChargerPowerClass]:
+        """Load all chargers for site and group by power level."""
+        rows = db.execute_query(
+            Queries.GET_SITE_CHARGERS,
+            (self.site_id,),
+            fetch=True
+        )
+        
+        # Group chargers by max_power and DC type
+        from collections import defaultdict
+        power_groups = defaultdict(lambda: {'charger_ids': [], 'is_dc': False})
+        
+        for r in rows:
+            max_power = float(r['max_power'] or 50.0)
+            is_dc = bool(r['dc_flag'])
+            key = (max_power, is_dc)
+            power_groups[key]['charger_ids'].append(r['charger_id'])
+            power_groups[key]['is_dc'] = is_dc
+        
+        # Create ChargerPowerClass objects
+        charger_classes = []
+        for (max_power, is_dc), data in sorted(power_groups.items(), reverse=True):
+            charger_classes.append(ChargerPowerClass(
+                max_power_kw=max_power,
+                count=len(data['charger_ids']),
+                is_dc=is_dc,
+                charger_ids=data['charger_ids']
+            ))
+        
+        total_chargers = sum(c.count for c in charger_classes)
+        logger.info(f"Loaded {total_chargers} chargers in {len(charger_classes)} power classes for site {self.site_id}")
+        for pc in charger_classes:
+            logger.info(f"  - {pc.count}x {pc.max_power_kw}kW {'DC' if pc.is_dc else 'AC'} chargers")
+        
+        return charger_classes
+    
+    def _get_last_nighttime_charger(self, vehicle_id: int, reference_time: datetime) -> Optional[int]:
+        """Get charger used during last nighttime period (7PM-7AM) within 24 hours."""
+        query = """
+            SELECT connector_id, charge_start_date_time
+            FROM t_charge_schedule
+            WHERE vehicle_id = %s
+              AND charge_start_date_time >= %s - INTERVAL '24 hours'
+              AND charge_start_date_time <= %s
+              AND charge_power > 0
+              AND (EXTRACT(HOUR FROM charge_start_date_time) >= 19 
+                   OR EXTRACT(HOUR FROM charge_start_date_time) < 7)
+            ORDER BY charge_start_date_time DESC
+            LIMIT 1
+        """
+        try:
+            rows = db.execute_query(query, (vehicle_id, reference_time, reference_time), fetch=True)
+            if rows and rows[0].get('connector_id'):
+                return int(rows[0]['connector_id'])
+        except Exception as e:
+            logger.warning(f"Failed to get last nighttime charger for vehicle {vehicle_id}: {e}")
+        return None
     
     def _load_vehicle_routes(
         self, vehicles: List[Vehicle], planning_start: datetime, planning_end: datetime
@@ -838,6 +905,8 @@ class UnifiedController:
                     if vehicle_schedule.assigned_charger_id is not None
                     else "1"
                 )
+                assigned_charger_power_kw = vehicle_schedule.assigned_charger_power_kw
+                
                 slot_power_map = {
                     slot.time_slot: slot.charge_power_kw
                     for slot in vehicle_schedule.charge_slots
@@ -857,6 +926,7 @@ class UnifiedController:
                             datetime.utcnow(),
                             250,    # capacity_line (required, not null)
                             None,   # opt_level
+                            assigned_charger_power_kw,
                         ),
                     )
                     total_inserted += 1
@@ -921,18 +991,43 @@ class UnifiedController:
         planning_start = min(all_slot_times)
         planning_end = max(all_slot_times) + timedelta(minutes=30)
         
-        # Per vehicle: list of (slot_time, charge_power_kw), total energy
+        # Per vehicle: list of (slot_time, charge_power_kw), total energy, connector_id, charger_power
         vehicle_charge_slots: Dict[int, List[Tuple[datetime, float]]] = {}
         vehicle_energy: Dict[int, float] = {}
+        vehicle_connector: Dict[int, int] = {}  # Track connector_id per vehicle
+        vehicle_charger_power: Dict[int, float] = {}  # Track assigned charger power per vehicle
         for r in charge_rows:
             vid = r['vehicle_id']
             t = r['charge_start_date_time']
             p = float(r['charge_power'] or 0)
+            connector_id = r.get('connector_id')
+            charger_power = r.get('assigned_charger_power_kw')
+            
             if vid not in vehicle_charge_slots:
                 vehicle_charge_slots[vid] = []
                 vehicle_energy[vid] = 0.0
             vehicle_charge_slots[vid].append((t, p))
             vehicle_energy[vid] += p * slot_duration_hours
+            
+            # Track connector_id (should be consistent across all slots for a vehicle)
+            if connector_id and vid not in vehicle_connector:
+                vehicle_connector[vid] = int(connector_id)
+            
+            # Track charger power (should be consistent across all slots for a vehicle)
+            if charger_power and vid not in vehicle_charger_power:
+                vehicle_charger_power[vid] = float(charger_power)
+        
+        # Load charger power levels for connectors (fallback if not in schedule)
+        charger_power_map: Dict[int, float] = {}
+        if vehicle_connector:
+            charger_ids = list(vehicle_connector.values())
+            charger_rows = db.execute_query(
+                Queries.GET_SITE_CHARGERS,
+                (site_id,),
+                fetch=True
+            )
+            for r in charger_rows:
+                charger_power_map[r['charger_id']] = float(r['max_power'] or 50.0)
         
         total_energy_scheduled_kwh = sum(vehicle_energy.values())
         vehicles_scheduled = len(vehicle_charge_slots)
@@ -1109,6 +1204,10 @@ class UnifiedController:
                     estimated_final_soc_percent=estimated_final_soc_percent,
                     energy_required_for_routes_kwh=energy_required_for_routes_kwh,
                     charge_rate_kw=charge_rate_kw,
+                    assigned_charger_power_kw=(
+                        vehicle_charger_power.get(vid) or  # Try database first
+                        (charger_power_map.get(vehicle_connector.get(vid)) if vid in vehicle_connector else None)  # Fallback to charger query
+                    ),
                     allocated_route_ids=allocated_route_ids,
                     routes_allocated_count=len(allocated_route_ids),
                     allocated_routes=allocated_routes,

@@ -111,6 +111,7 @@ class VehicleChargeState:
     is_connected: bool
     charger_id: Optional[int] = None
     charger_type: Optional[str] = None  # 'AC' or 'DC'
+    last_nighttime_charger_id: Optional[int] = None  # Charger used in last nighttime period
     
     # Vehicle capabilities
     ac_charge_rate_kw: float = 11.0
@@ -131,6 +132,24 @@ class VehicleChargeState:
     def is_available_for_charging(self) -> bool:
         """Check if vehicle can be charged."""
         return self.status != 'VOR' and self.is_connected
+
+
+@dataclass
+class Charger:
+    """Charger configuration."""
+    charger_id: int
+    site_id: int
+    max_power_kw: float
+    is_dc: bool
+
+
+@dataclass
+class ChargerPowerClass:
+    """Grouped chargers by power level."""
+    max_power_kw: float
+    count: int
+    is_dc: bool
+    charger_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -255,6 +274,7 @@ class VehicleChargeSchedule:
     # Charger assignment
     assigned_charger_id: Optional[int] = None
     charger_type: Optional[str] = None
+    assigned_charger_power_kw: Optional[float] = None
     
     # Validation
     meets_route_requirements: bool = True
@@ -272,6 +292,7 @@ class VehicleChargeSchedule:
             'total_energy_scheduled_kwh': self.total_energy_scheduled_kwh,
             'assigned_charger_id': self.assigned_charger_id,
             'charger_type': self.charger_type,
+            'assigned_charger_power_kw': self.assigned_charger_power_kw,
             'meets_route_requirements': self.meets_route_requirements,
             'energy_shortfall_kwh': self.energy_shortfall_kwh,
             'route_checkpoints': len(self.route_checkpoints),
@@ -351,6 +372,7 @@ class VehicleScheduleReport:
     estimated_final_soc_percent: Optional[float] = None
     energy_required_for_routes_kwh: float = 0.0
     charge_rate_kw: Optional[float] = None
+    assigned_charger_power_kw: Optional[float] = None
 
     # Route allocation fields (from t_route_allocated)
     allocated_route_ids: List[str] = field(default_factory=list)
@@ -372,6 +394,7 @@ class VehicleScheduleReport:
             'estimated_final_soc_percent': self.estimated_final_soc_percent,
             'energy_required_for_routes_kwh': self.energy_required_for_routes_kwh,
             'charge_rate_kw': self.charge_rate_kw,
+            'assigned_charger_power_kw': self.assigned_charger_power_kw,
             'allocated_route_ids': self.allocated_route_ids,
             'routes_allocated_count': self.routes_allocated_count,
             'allocated_routes': self.allocated_routes,

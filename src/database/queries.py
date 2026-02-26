@@ -136,7 +136,7 @@ class Queries:
     GET_SITE_CHARGERS = """
         SELECT charger_id, site_id, max_power, dc_flag
         FROM t_charger
-        WHERE site_id = %s
+        WHERE site_id = %s AND active = true
     """
     
     # Route Allocated Queries
@@ -301,8 +301,8 @@ class Queries:
         INSERT INTO t_charge_schedule (
             schedule_id, vehicle_id, charge_start_date_time, charge_power,
             power_unit_id, charge_profile_flag, connector_id,
-            created_date_time, capacity_line, opt_level
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            created_date_time, capacity_line, opt_level, assigned_charger_power_kw
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     
     DELETE_CHARGE_SCHEDULE_BY_SCHEDULE_ID = """
@@ -312,7 +312,8 @@ class Queries:
     
     GET_CHARGE_SCHEDULE_BY_SCHEDULE_ID = """
         SELECT
-            schedule_id, vehicle_id, charge_start_date_time, charge_power
+            schedule_id, vehicle_id, charge_start_date_time, charge_power,
+            connector_id, assigned_charger_power_kw
         FROM t_charge_schedule
         WHERE schedule_id = %s
         ORDER BY vehicle_id, charge_start_date_time
