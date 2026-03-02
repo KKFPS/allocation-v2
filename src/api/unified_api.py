@@ -80,6 +80,10 @@ class UnifiedOptimizationRequest(BaseModel):
     synthetic_time_price_factor: Optional[float] = Field(None, description="Time preference factor")
     target_soc_percent: Optional[float] = Field(None, description="Target SOC percentage")
     site_capacity_kw: Optional[float] = Field(None, description="Site capacity in kW")
+    enable_charger_allocation: Optional[bool] = Field(
+        None,
+        description="Enable charger allocation constraints (default: True). When False, ignores site chargers and skips constraints C1-C5."
+    )
 
     # Microlise TMS integration
     microlise_enabled: bool = Field(
@@ -185,6 +189,7 @@ def _build_config_from_request(req: UnifiedOptimizationRequest) -> Optional[Unif
         req.synthetic_time_price_factor,
         req.target_soc_percent,
         req.site_capacity_kw,
+        req.enable_charger_allocation,
     ]
     if all(o is None for o in overrides):
         return None
@@ -203,6 +208,7 @@ def _build_config_from_request(req: UnifiedOptimizationRequest) -> Optional[Unif
         synthetic_time_price_factor=req.synthetic_time_price_factor if req.synthetic_time_price_factor is not None else defaults.synthetic_time_price_factor,
         target_soc_percent=req.target_soc_percent if req.target_soc_percent is not None else defaults.target_soc_percent,
         site_capacity_kw=req.site_capacity_kw if req.site_capacity_kw is not None else defaults.site_capacity_kw,
+        enable_charger_allocation=req.enable_charger_allocation if req.enable_charger_allocation is not None else defaults.enable_charger_allocation,
     )
 
 

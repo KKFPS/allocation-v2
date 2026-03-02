@@ -68,6 +68,9 @@ class UnifiedOptimizationConfig:
     
     # Site capacity
     site_capacity_kw: float = 0.0
+    
+    # Charger allocation
+    enable_charger_allocation: bool = True  # Enable charger allocation constraints (C1-C5)
 
 
 @dataclass
@@ -425,10 +428,21 @@ class UnifiedOptimizer:
             
             vehicle_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
             
+            # Calculate minimum charger power at site (if chargers available)
+            min_charger_power_kw = None
+            if site_chargers and not self.config.enable_charger_allocation:
+                min_charger_power_kw = min(pc.max_power_kw for pc in site_chargers)
+                logger.info(f"[UNIFIED:SCHED] Charger allocation disabled - using min site charger power: {min_charger_power_kw} kW")
+            
             # Bounds helpers
             def _max_charge_kw(v_idx: int) -> float:
                 state = vehicle_states.get(vehicles[v_idx].vehicle_id)
-                return state.ac_charge_rate_kw if state else 50.0
+                vehicle_max = state.ac_charge_rate_kw if state else 50.0
+                
+                # If charger allocation disabled but chargers available, limit by min charger power
+                if min_charger_power_kw is not None:
+                    return min(vehicle_max, min_charger_power_kw)
+                return vehicle_max
             
             def _max_cumulative_kwh(v_idx: int) -> float:
                 state = vehicle_states.get(vehicles[v_idx].vehicle_id)
@@ -447,11 +461,11 @@ class UnifiedOptimizer:
                 for _ in range(n_slots)
             ]
             
-            # Charger allocation binary variables (if chargers provided)
+            # Charger allocation binary variables (if chargers provided and enabled)
             charger_assigned = None
             charger_power_to_idx = {}
             n_charger_classes = 0
-            if site_chargers:
+            if site_chargers and self.config.enable_charger_allocation:
                 n_charger_classes = len(site_chargers)
                 charger_power_to_idx = {pc.max_power_kw: idx for idx, pc in enumerate(site_chargers)}
                 charger_assigned = [
@@ -460,6 +474,8 @@ class UnifiedOptimizer:
                 ]
                 total_chargers = sum(pc.count for pc in site_chargers)
                 logger.info(f"[UNIFIED:SCHED] Added charger allocation vars: {n_vehicles} vehicles x {n_charger_classes} power classes ({total_chargers} chargers)")
+            elif site_chargers and not self.config.enable_charger_allocation:
+                logger.info(f"[UNIFIED:SCHED] Charger allocation DISABLED by config (site has {len(site_chargers)} power classes)")
             
             # Build objective: minimize charging cost + shortfall penalty
             cost_terms = []
@@ -514,7 +530,7 @@ class UnifiedOptimizer:
             
             vehicle_schedules, total_cost, total_energy = self._extract_scheduling_solution(
                 schedule_id, vehicles, vehicle_states, energy_requirements,
-                time_slots, price_data, charge_power, cumulative_energy, vehicle_to_idx,
+                availability_matrices, time_slots, price_data, charge_power, cumulative_energy, vehicle_to_idx,
                 site_chargers, charger_assigned
             )
             
@@ -603,9 +619,20 @@ class UnifiedOptimizer:
                     model.constraint(coverage_sum <= len(covering_sequences) * route_covered)
             
             # ===== SCHEDULING VARIABLES =====
+            # Calculate minimum charger power at site (if chargers available)
+            min_charger_power_kw = None
+            if site_chargers and not self.config.enable_charger_allocation:
+                min_charger_power_kw = min(pc.max_power_kw for pc in site_chargers)
+                logger.info(f"[UNIFIED:INTEGRATED] Charger allocation disabled - using min site charger power: {min_charger_power_kw} kW")
+            
             def _max_charge_kw(v_idx: int) -> float:
                 state = vehicle_states.get(vehicles[v_idx].vehicle_id)
-                return state.ac_charge_rate_kw if state else 50.0
+                vehicle_max = state.ac_charge_rate_kw if state else 50.0
+                
+                # If charger allocation disabled but chargers available, limit by min charger power
+                if min_charger_power_kw is not None:
+                    return min(vehicle_max, min_charger_power_kw)
+                return vehicle_max
             
             def _max_cumulative_kwh(v_idx: int) -> float:
                 state = vehicle_states.get(vehicles[v_idx].vehicle_id)
@@ -623,11 +650,11 @@ class UnifiedOptimizer:
                 for _ in range(n_slots)
             ]
             
-            # Charger allocation binary variables (if chargers provided)
+            # Charger allocation binary variables (if chargers provided and enabled)
             charger_assigned = None
             charger_power_to_idx = {}
             n_charger_classes = 0
-            if site_chargers:
+            if site_chargers and self.config.enable_charger_allocation:
                 n_charger_classes = len(site_chargers)
                 charger_power_to_idx = {pc.max_power_kw: idx for idx, pc in enumerate(site_chargers)}
                 charger_assigned = [
@@ -636,6 +663,8 @@ class UnifiedOptimizer:
                 ]
                 total_chargers = sum(pc.count for pc in site_chargers)
                 logger.info(f"[UNIFIED:INTEGRATED] Added charger allocation vars: {n_vehicles} vehicles x {n_charger_classes} power classes ({total_chargers} chargers)")
+            elif site_chargers and not self.config.enable_charger_allocation:
+                logger.info(f"[UNIFIED:INTEGRATED] Charger allocation DISABLED by config (site has {len(site_chargers)} power classes)")
             
             # ===== OBJECTIVE: WEIGHTED SUM =====
             
@@ -719,7 +748,7 @@ class UnifiedOptimizer:
             # Extract scheduling solution
             vehicle_schedules, total_cost, total_energy = self._extract_scheduling_solution(
                 schedule_id, vehicles, vehicle_states, energy_requirements,
-                time_slots, price_data, charge_power, cumulative_energy, vehicle_to_idx,
+                availability_matrices, time_slots, price_data, charge_power, cumulative_energy, vehicle_to_idx,
                 site_chargers, charger_assigned
             )
             
@@ -843,6 +872,11 @@ class UnifiedOptimizer:
             
             max_charge_rate = state.ac_charge_rate_kw
             
+            # If charger allocation disabled but chargers available, limit by min charger power
+            if site_chargers and not self.config.enable_charger_allocation:
+                min_site_charger_power = min(pc.max_power_kw for pc in site_chargers)
+                max_charge_rate = min(max_charge_rate, min_site_charger_power)
+            
             for t_idx in range(n_slots):
                 model.constraint(charge_power[t_idx][v_idx] <= max_charge_rate)
         
@@ -859,7 +893,16 @@ class UnifiedOptimizer:
         # ===== CHARGER ALLOCATION CONSTRAINTS =====
         if site_chargers and charger_assigned and charger_power_to_idx:
             n_charger_classes = len(site_chargers)
-            logger.info(f"[UNIFIED] Adding charger allocation constraints for {n_charger_classes} power classes")
+            total_chargers = sum(pc.count for pc in site_chargers)
+            logger.info(f"[UNIFIED] Adding charger allocation constraints for {n_charger_classes} power classes ({total_chargers} total chargers)")
+            
+            # Log details of each charger power class and their counts
+            for pc_idx, power_class in enumerate(site_chargers):
+                charger_type = 'DC' if power_class.is_dc else 'AC'
+                logger.info(
+                    f"[UNIFIED]   Power Class {pc_idx}: {power_class.max_power_kw}kW ({charger_type}) - "
+                    f"Count: {power_class.count}, Charger IDs: {power_class.charger_ids}"
+                )
             
             # Helper: Find power class index for a given charger_id
             def find_power_class_for_charger(charger_id: int) -> Optional[int]:
@@ -870,6 +913,7 @@ class UnifiedOptimizer:
             
             # 7. Fixed Charger Power Class (Already Connected)
             # If vehicle is connected, assign to the power class of that charger
+            fixed_vehicle_count = 0
             for v_idx, vehicle in enumerate(vehicles):
                 state = vehicle_states.get(vehicle.vehicle_id)
                 if state and state.charger_id is not None:
@@ -882,8 +926,13 @@ class UnifiedOptimizer:
                             if other_pc_idx != pc_idx:
                                 model.constraint(charger_assigned[v_idx][other_pc_idx] == 0)
                         logger.debug(f"[UNIFIED] Fixed vehicle {vehicle.vehicle_id} to power class {site_chargers[pc_idx].max_power_kw}kW")
+                        fixed_vehicle_count += 1
+            
+            if fixed_vehicle_count > 0:
+                logger.info(f"[UNIFIED] Fixed {fixed_vehicle_count} vehicles to their currently connected charger power class")
             
             # 8. One Power Class Per Vehicle
+            logger.info(f"[UNIFIED] Adding one-power-class-per-vehicle constraint: {n_vehicles} vehicles must each be assigned exactly 1 charger power class")
             for v_idx in range(n_vehicles):
                 model.constraint(model.sum(charger_assigned[v_idx]) == 1)
             
@@ -903,6 +952,7 @@ class UnifiedOptimizer:
             
             # 10. Nighttime Charger Continuity Constraint
             # If vehicle used a charger during last nighttime period, continue using same power class
+            nighttime_continuity_count = 0
             for v_idx, vehicle in enumerate(vehicles):
                 state = vehicle_states.get(vehicle.vehicle_id)
                 if state and state.last_nighttime_charger_id is not None and state.charger_id is None:
@@ -926,32 +976,44 @@ class UnifiedOptimizer:
                                 if other_pc_idx != pc_idx:
                                     model.constraint(charger_assigned[v_idx][other_pc_idx] == 0)
                             logger.debug(f"[UNIFIED] Enforcing nighttime continuity: vehicle {vehicle.vehicle_id} must use {site_chargers[pc_idx].max_power_kw}kW power class")
+                            nighttime_continuity_count += 1
+            
+            if nighttime_continuity_count > 0:
+                logger.info(f"[UNIFIED] Applied nighttime charger continuity constraint to {nighttime_continuity_count} vehicles")
             
             # 11. Time-Slot Charger Capacity Constraint
-            # At each time slot, number of vehicles actively charging with a power class
-            # cannot exceed the count of chargers available in that power class
-            logger.info(f"[UNIFIED] Adding time-slot capacity constraints for charger power classes")
+            # At each time slot, number of vehicles assigned to a power class that are available
+            # (could potentially be connected/charging) cannot exceed the count of chargers in that power class
+            logger.info(f"[UNIFIED] Adding time-slot charger count capacity constraints:")
+            for pc_idx in range(n_charger_classes):
+                power_class = site_chargers[pc_idx]
+                logger.info(
+                    f"[UNIFIED]   Power Class {pc_idx} ({power_class.max_power_kw}kW): "
+                    f"max {power_class.count} vehicles can be assigned/connected per slot"
+                )
+            
             for t_idx in range(n_slots):
                 for pc_idx in range(n_charger_classes):
-                    # Count vehicles charging at this time slot with this power class
-                    # A vehicle is "using" the charger if: charge_power > 0 AND assigned to this power class
-                    # We use a binary indicator: is_charging[v] = 1 if charge_power[t][v] > 0
-                    # Then: sum(is_charging[v] * charger_assigned[v][pc]) <= power_class.count
+                    # Count vehicles assigned to this power class that are available at this time slot
+                    # A vehicle occupies a charger if: assigned to power class AND available at this slot
+                    # (availability means the vehicle could be connected, regardless of charge_power)
                     
-                    # Since charge_power is continuous, we need to check if it's > 0
-                    # In Hexaly, we can use: sum over vehicles of (charger_assigned[v][pc] * (charge_power > 0))
-                    # But (charge_power > 0) creates a boolean, which works in constraints
+                    vehicles_occupying_charger = []
+                    for v_idx in range(n_vehicles):
+                        vehicle = vehicles[v_idx]
+                        availability = availability_matrices.get(vehicle.vehicle_id)
+                        
+                        # If vehicle is available at this slot and assigned to this power class,
+                        # it occupies a charger spot
+                        if availability and availability.availability_matrix[t_idx]:
+                            vehicles_occupying_charger.append(charger_assigned[v_idx][pc_idx])
                     
-                    vehicles_using_charger = model.sum([
-                        charger_assigned[v_idx][pc_idx] * (charge_power[t_idx][v_idx] > 0)
-                        for v_idx in range(n_vehicles)
-                    ])
-                    
-                    charger_count = site_chargers[pc_idx].count
-                    model.constraint(vehicles_using_charger <= charger_count)
+                    if vehicles_occupying_charger:
+                        charger_count = site_chargers[pc_idx].count
+                        model.constraint(model.sum(vehicles_occupying_charger) <= charger_count)
             
             logger.info(
-                f"[UNIFIED] Added {n_slots * n_charger_classes} time-slot capacity constraints "
+                f"[UNIFIED] Added {n_slots * n_charger_classes} time-slot charger count constraints "
                 f"({n_slots} slots × {n_charger_classes} power classes)"
             )
     
@@ -961,6 +1023,7 @@ class UnifiedOptimizer:
         vehicles: List[Vehicle],
         vehicle_states: Dict[int, VehicleChargeState],
         energy_requirements: Dict[int, List[RouteEnergyRequirement]],
+        availability_matrices: Dict[int, VehicleAvailability],
         time_slots: List[datetime],
         price_data: Dict[datetime, Tuple[float, bool]],
         charge_power: List[List],
@@ -974,6 +1037,17 @@ class UnifiedOptimizer:
         total_cost = 0.0
         total_energy = 0.0
         n_slots = len(time_slots)
+        
+        # Track charger allocation statistics
+        charger_allocation_stats = {}
+        if charger_assigned and site_chargers:
+            for pc_idx, power_class in enumerate(site_chargers):
+                charger_allocation_stats[pc_idx] = {
+                    'power_kw': power_class.max_power_kw,
+                    'type': 'DC' if power_class.is_dc else 'AC',
+                    'count': power_class.count,
+                    'vehicles': []
+                }
         
         for v_idx, vehicle in enumerate(vehicles):
             state = vehicle_states.get(vehicle.vehicle_id)
@@ -1030,6 +1104,19 @@ class UnifiedOptimizer:
                         # If vehicle has a connected charger, keep that ID, otherwise pick first from power class
                         if assigned_charger_id is None and power_class.charger_ids:
                             assigned_charger_id = power_class.charger_ids[0]
+                        
+                        # Track allocation for statistics
+                        charger_allocation_stats[pc_idx]['vehicles'].append({
+                            'vehicle_id': vehicle.vehicle_id,
+                            'charger_id': assigned_charger_id,
+                            'energy_scheduled': cumulative
+                        })
+                        
+                        logger.debug(
+                            f"[UNIFIED] Vehicle {vehicle.vehicle_id} assigned to {assigned_charger_power_kw}kW "
+                            f"({assigned_charger_type}) charger (ID: {assigned_charger_id}), "
+                            f"scheduled {cumulative:.2f} kWh"
+                        )
                         break
             
             vehicle_schedule = VehicleChargeSchedule(
@@ -1047,6 +1134,60 @@ class UnifiedOptimizer:
                 assigned_charger_power_kw=assigned_charger_power_kw
             )
             vehicle_schedules.append(vehicle_schedule)
+        
+        # Log charger allocation summary
+        if charger_allocation_stats:
+            logger.info("[UNIFIED] Charger Allocation Results:")
+            for pc_idx, stats in charger_allocation_stats.items():
+                num_vehicles_assigned = len(stats['vehicles'])
+                total_energy = sum(v['energy_scheduled'] for v in stats['vehicles'])
+                logger.info(
+                    f"[UNIFIED]   Power Class {pc_idx} ({stats['power_kw']}kW {stats['type']}): "
+                    f"{num_vehicles_assigned} vehicles assigned to power class (max {stats['count']} chargers available), "
+                    f"total energy scheduled: {total_energy:.2f} kWh"
+                )
+                if num_vehicles_assigned > 0:
+                    vehicle_ids = [v['vehicle_id'] for v in stats['vehicles']]
+                    logger.info(f"[UNIFIED]     Vehicles: {vehicle_ids}")
+            
+            # Validate time-slot constraints - check max simultaneous assignments per slot
+            logger.info("[UNIFIED] Validating charger capacity constraints per time slot:")
+            for pc_idx, stats in charger_allocation_stats.items():
+                max_simultaneous = 0
+                violation_detected = False
+                
+                for t_idx in range(n_slots):
+                    # Count how many vehicles assigned to this power class are available at this slot
+                    # (available = could be connected to charger, regardless of charging)
+                    connected_count = 0
+                    for v in stats['vehicles']:
+                        v_idx = vehicle_to_idx.get(v['vehicle_id'])
+                        if v_idx is not None:
+                            vehicle = vehicles[v_idx]
+                            availability = availability_matrices.get(vehicle.vehicle_id)
+                            if availability and availability.availability_matrix[t_idx]:
+                                connected_count += 1
+                    
+                    max_simultaneous = max(max_simultaneous, connected_count)
+                    
+                    if connected_count > stats['count']:
+                        violation_detected = True
+                        logger.error(
+                            f"[UNIFIED] CONSTRAINT VIOLATION at slot {t_idx}: "
+                            f"Power Class {pc_idx} ({stats['power_kw']}kW) has {connected_count} vehicles available/connected "
+                            f"but only {stats['count']} chargers available"
+                        )
+                
+                if not violation_detected:
+                    logger.info(
+                        f"[UNIFIED]   Power Class {pc_idx} ({stats['power_kw']}kW): "
+                        f"max {max_simultaneous} vehicles connected simultaneously (limit: {stats['count']}) ✓"
+                    )
+                else:
+                    logger.error(
+                        f"[UNIFIED]   Power Class {pc_idx} ({stats['power_kw']}kW): "
+                        f"VIOLATION - max {max_simultaneous} vehicles connected simultaneously (limit: {stats['count']}) ✗"
+                    )
         
         return vehicle_schedules, total_cost, total_energy
     
