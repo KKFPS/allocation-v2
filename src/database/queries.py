@@ -283,6 +283,7 @@ class Queries:
         FROM t_site_energy_forecast_history
         WHERE site_id = %s
             AND forecasted_date_time BETWEEN %s AND %s
+            AND forecasting_method_id = 2
         ORDER BY forecasted_date_time ASC
     """
     
