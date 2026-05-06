@@ -43,7 +43,7 @@ LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 
 # Default System Parameters
 DEFAULT_ALLOCATION_WINDOW_HOURS = 18
-DEFAULT_MAX_ROUTES_PER_VEHICLE = 5
+DEFAULT_MAX_ROUTES_PER_VEHICLE = 4
 DEFAULT_RESERVE_VEHICLE_COUNT = 2
 DEFAULT_TURNAROUND_TIME_MINUTES = 45
 
@@ -72,7 +72,6 @@ DEFAULT_PENALTIES = {
     'turnaround_time_preferred': -2,
     'shift_hours_strict': -20,
     'minimum_soonness': -20,
-    'route_overlap': -20,
     'charger_preference': 3,
     'swap_minimization': 0.5,
     'energy_optimization': 0.5
@@ -85,7 +84,6 @@ DEFAULT_CONSTRAINT_ENABLED = {
     'turnaround_time_preferred': True,
     'shift_hours_strict': True,
     'minimum_soonness': True,
-    'route_overlap': True,
     'swap_minimization': True,
     'energy_optimization': True,
 }

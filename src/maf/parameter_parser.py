@@ -214,7 +214,6 @@ def get_all_constraint_configs(site_id: int, site_config: Dict) -> Dict[str, Dic
         'turnaround_time_preferred',
         'shift_hours_strict',
         'minimum_soonness',
-        'route_overlap',
         'charger_preference',
         'swap_minimization',
         'energy_optimization'

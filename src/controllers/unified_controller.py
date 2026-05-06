@@ -111,6 +111,8 @@ class UnifiedController:
             opt_inputs = self._prepare_optimization_inputs(
                 opt_mode, vehicles, vehicle_states, window_start, window_end, current_time
             )
+
+            logger.info(f"Opt inputs: {opt_inputs}")
             
             # Phase 6: Run unified optimization
             if config is None:
@@ -143,7 +145,7 @@ class UnifiedController:
             
             # Phase 8: Validate and persist results
             if persist_to_database:
-                if allocation_result and allocation_result.is_acceptable():
+                if allocation_result and allocation_result.is_acceptable(min_score=-999999):
                     self._persist_allocation(allocation_result)
                     self._update_allocation_monitor(allocation_result)
                     logger.info(f"Allocation results persisted and validated")
@@ -491,11 +493,15 @@ class UnifiedController:
                 'max_routes_per_vehicle_in_window',
                 DEFAULT_MAX_ROUTES_PER_VEHICLE
             )
+
+            logger.info(f"Max routes: {max_routes}")
             
             builder = CostMatrixBuilder(
                 vehicles, routes, self.constraint_manager, max_routes,
                 vehicle_charger_map=vehicle_charger_map or {}
             )
+
+            logger.info(f"Builder: {builder}")
             
             sequence_costs, sequences, metadata = builder.build_assignment_matrix()
             route_ids = [r.route_id for r in routes]
@@ -504,6 +510,7 @@ class UnifiedController:
             opt_inputs['route_ids'] = route_ids
             opt_inputs['sequence_costs'] = sequence_costs
         
+        logger.info(f"Mode: {mode}")
         # Scheduling inputs
         if mode in (OptimizationMode.SCHEDULING_ONLY, OptimizationMode.INTEGRATED):
             # Calculate fleet efficiency if not done

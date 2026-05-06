@@ -20,12 +20,13 @@ Examples:
 """
 
 from datetime import datetime
+from enum import Enum
 from src.utils.logging_config import logger
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
 from src.controllers.unified_controller import UnifiedController
 from src.integrations.microlise import MicroLiseClient, MicroLiseParams
@@ -35,6 +36,24 @@ from src.optimizer.unified_optimizer import (
 )
 
 print("Unified API loaded")
+
+
+class OptimizationModeRequest(str, Enum):
+    """Allowed optimization mode values for API requests."""
+
+    allocation_only = "allocation_only"
+    allocation = "allocation"
+    scheduling_only = "scheduling_only"
+    scheduling = "scheduling"
+    integrated = "integrated"
+    both = "both"
+
+
+class MicroliseConnectionType(str, Enum):
+    """Allowed Microlise connection values for API requests."""
+
+    test = "test"
+    prod = "prod"
 
 # --- Request body: all optional except site_id, with defaults ---
 
@@ -47,7 +66,7 @@ class UnifiedOptimizationRequest(BaseModel):
     schedule_id: Optional[int] = Field(None, description="Existing schedule ID (optional)")
 
     # Test / override current time (as in test_unified_optimizer.py)
-    test_start_time: Optional[str] = Field(
+    test_start_time: Optional[datetime] = Field(
         None,
         description=(
             "Start time for optimization (simulated 'now'). "
@@ -56,8 +75,8 @@ class UnifiedOptimizationRequest(BaseModel):
         ),
     )
 
-    mode: str = Field(
-        "integrated",
+    mode: OptimizationModeRequest = Field(
+        OptimizationModeRequest.integrated,
         description="Optimization mode: allocation_only, scheduling_only, integrated",
     )
     persist_to_database: bool = Field(True, description="Whether to persist results to DB")
@@ -65,21 +84,22 @@ class UnifiedOptimizationRequest(BaseModel):
     # Planning window
     window_hours: float = Field(
         24.0,
+        gt=0,
         description="Total planning window in hours (default: 24). Overrides site/MAF allocation_window_hours when set.",
     )
 
     # Optimization config overrides (fallbacks to UnifiedOptimizationConfig defaults)
-    allocation_time_limit: Optional[int] = Field(None, description="Allocation phase time limit (seconds)")
-    scheduling_time_limit: Optional[int] = Field(None, description="Scheduling phase time limit (seconds)")
-    integrated_time_limit: Optional[int] = Field(None, description="Integrated mode time limit (seconds)")
-    route_count_weight: Optional[float] = Field(None, description="Weight for route coverage priority")
-    allocation_score_weight: Optional[float] = Field(None, description="α: weight for allocation score")
-    scheduling_cost_weight: Optional[float] = Field(None, description="β: weight for scheduling cost")
-    target_soc_shortfall_penalty: Optional[float] = Field(None, description="λ: penalty per kWh shortfall")
-    triad_penalty_factor: Optional[float] = Field(None, description="TRIAD period penalty factor")
-    synthetic_time_price_factor: Optional[float] = Field(None, description="Time preference factor")
-    target_soc_percent: Optional[float] = Field(None, description="Target SOC percentage")
-    site_capacity_kw: Optional[float] = Field(None, description="Site capacity in kW")
+    allocation_time_limit: Optional[int] = Field(None, gt=0, description="Allocation phase time limit (seconds)")
+    scheduling_time_limit: Optional[int] = Field(None, gt=0, description="Scheduling phase time limit (seconds)")
+    integrated_time_limit: Optional[int] = Field(None, gt=0, description="Integrated mode time limit (seconds)")
+    route_count_weight: Optional[float] = Field(None, ge=0, description="Weight for route coverage priority")
+    allocation_score_weight: Optional[float] = Field(None, ge=0, description="α: weight for allocation score")
+    scheduling_cost_weight: Optional[float] = Field(None, ge=0, description="β: weight for scheduling cost")
+    target_soc_shortfall_penalty: Optional[float] = Field(None, ge=0, description="λ: penalty per kWh shortfall")
+    triad_penalty_factor: Optional[float] = Field(None, ge=0, description="TRIAD period penalty factor")
+    synthetic_time_price_factor: Optional[float] = Field(None, ge=0, description="Time preference factor")
+    target_soc_percent: Optional[float] = Field(None, ge=0, le=100, description="Target SOC percentage")
+    site_capacity_kw: Optional[float] = Field(None, ge=0, description="Site capacity in kW")
     enable_charger_allocation: Optional[bool] = Field(
         None,
         description="Enable charger allocation constraints (default: True). When False, ignores site chargers and skips constraints C1-C5."
@@ -100,8 +120,8 @@ class UnifiedOptimizationRequest(BaseModel):
             "synthetic 201 responses. Set to False to make live API calls."
         ),
     )
-    microlise_connection_type: str = Field(
-        "test",
+    microlise_connection_type: MicroliseConnectionType = Field(
+        MicroliseConnectionType.test,
         description=(
             "Connection type passed to the Microlise client: 'test' or 'prod'. "
             "Appends ': TEST' to alert messages when 'test'."
@@ -128,6 +148,8 @@ class UnifiedOptimizationRequest(BaseModel):
     )
     microlise_start_hour_allocation: int = Field(
         6,
+        ge=0,
+        le=23,
         description=(
             "Upper bound (exclusive, local hour) of the live-API window. "
             "Used to identify the qualifying initial allocation for the compliance report."
@@ -135,6 +157,8 @@ class UnifiedOptimizationRequest(BaseModel):
     )
     microlise_end_hour_allocation: int = Field(
         4,
+        ge=0,
+        le=23,
         description=(
             "Lower bound (inclusive, local hour) of the live-API window. "
             "Used to identify the qualifying initial allocation for the compliance report."
@@ -144,28 +168,30 @@ class UnifiedOptimizationRequest(BaseModel):
     class Config:
         extra = "ignore"
 
+    @validator("test_start_time", pre=True)
+    def _parse_test_start_time(cls, value: Optional[str]) -> Optional[datetime]:
+        """Allow test_start_time in ISO 8601 or 'YYYY-MM-DD HH:MM:SS' format."""
+        if value is None or isinstance(value, datetime):
+            return value
 
-def _parse_start_time(value: str) -> datetime:
-    """Parse test_start_time: ISO 8601 or 'YYYY-MM-DD HH:MM:SS'."""
-    value = value.strip()
-    # Try ISO format first
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        pass
-    # Try space-separated format (as in test_unified_optimizer.py)
-    try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        raise ValueError(
-            f"Invalid test_start_time: {value!r}. "
-            "Use ISO 8601 (e.g. 2026-02-16T04:30:00) or 'YYYY-MM-DD HH:MM:SS'."
-        )
+        value = value.strip()
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid test_start_time: {value!r}. "
+                "Use ISO 8601 (e.g. 2026-02-16T04:30:00) or 'YYYY-MM-DD HH:MM:SS'."
+            ) from exc
 
 
 def _build_config_from_request(req: UnifiedOptimizationRequest) -> Optional[UnifiedOptimizationConfig]:
     """Build UnifiedOptimizationConfig from request overrides; None if no overrides."""
-    mode_str = (req.mode or "integrated").lower()
+    mode_str = req.mode.value
     mode_map = {
         "allocation_only": OptimizationMode.ALLOCATION_ONLY,
         "allocation": OptimizationMode.ALLOCATION_ONLY,
@@ -272,9 +298,7 @@ app = FastAPI(
     ),
 )
 def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]:
-    current_time: Optional[datetime] = None
-    if body.test_start_time:
-        current_time = _parse_start_time(body.test_start_time)
+    current_time: Optional[datetime] = body.test_start_time
 
     config = _build_config_from_request(body)
 
@@ -286,7 +310,7 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
     try:
         allocation_result, schedule_result, unified_result = controller.run_unified_optimization(
             current_time=current_time,
-            mode=body.mode,
+            mode=body.mode.value,
             config=config,
             persist_to_database=body.persist_to_database,
             window_hours=body.window_hours,
@@ -361,24 +385,12 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
 )
 def get_schedule_report(
     schedule_id: int = Query(..., description="Schedule ID from t_scheduler"),
-    timestamp: Optional[str] = Query(
+    timestamp: Optional[datetime] = Query(
         None,
         description="As-of time for report (ISO 8601 or 'YYYY-MM-DD HH:MM:SS'). Default: now.",
     ),
 ) -> Dict[str, Any]:
-    if timestamp is None:
-        report_timestamp = datetime.now()
-    else:
-        try:
-            report_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        except ValueError:
-            try:
-                report_timestamp = datetime.strptime(timestamp.strip(), "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid timestamp. Use ISO 8601 (e.g. 2026-02-16T06:00:00) or 'YYYY-MM-DD HH:MM:SS'.",
-                )
+    report_timestamp = timestamp or datetime.now()
 
     controller = UnifiedController(site_id=0)
     try:

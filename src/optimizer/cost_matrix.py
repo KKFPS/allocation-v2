@@ -3,16 +3,20 @@ import csv
 import os
 from typing import List, Dict, Tuple, Optional
 from itertools import combinations
+from math import comb
 
 import numpy as np
 
 from src.models.vehicle import Vehicle
 from src.models.route import Route
 from src.constraints.constraint_manager import ConstraintManager
+from src.constraints.turnaround_time import TurnaroundTimeStrictConstraint
+from src.config import DEFAULT_TURNAROUND_TIME_MINUTES
 from src.utils.logging_config import logger
 
 # Set to True to dump all matrices and constraint params to a single CSV (decision vars left empty).
 DEBUG_DUMP_COST_MATRIX_CSV = False
+PROGRESS_LOG_EVERY_COMBINATIONS = 5000
 
 
 def _debug_dump_matrices_to_csv(
@@ -123,6 +127,90 @@ class CostMatrixBuilder:
         
         # Sort routes by start time for sequencing
         self.routes.sort(key=lambda r: r.plan_start_date_time)
+        self.turnaround_minutes = self._resolve_overlap_turnaround_minutes()
+        self.route_pair_compatibility = self._build_route_pair_compatibility()
+    
+    def _resolve_overlap_turnaround_minutes(self) -> int:
+        """
+        Resolve turnaround minutes used for overlap pruning.
+        
+        Uses strict-turnaround constraint parameter when available to keep
+        overlap pruning aligned with active constraint configuration.
+        """
+        for constraint in self.constraint_manager.get_enabled_constraints():
+            if isinstance(constraint, TurnaroundTimeStrictConstraint):
+                minimum = constraint.params.get(
+                    'minimum_minutes',
+                    DEFAULT_TURNAROUND_TIME_MINUTES
+                )
+                try:
+                    return int(minimum)
+                except (TypeError, ValueError):
+                    return DEFAULT_TURNAROUND_TIME_MINUTES
+        
+        return DEFAULT_TURNAROUND_TIME_MINUTES
+    
+    def _build_route_pair_compatibility(self) -> Dict[Tuple[str, str], bool]:
+        """Precompute compatibility for all route pairs."""
+        compatibility: Dict[Tuple[str, str], bool] = {}
+        
+        for i in range(len(self.routes) - 1):
+            left = self.routes[i]
+            for j in range(i + 1, len(self.routes)):
+                right = self.routes[j]
+                key = tuple(sorted((left.route_id, right.route_id)))
+                compatibility[key] = not left.overlaps_with(
+                    right, self.turnaround_minutes
+                )
+        
+        return compatibility
+    
+    def _is_non_overlapping_sequence(self, route_sequence: List[Route]) -> bool:
+        """Check sequence overlap feasibility using cached pair compatibility."""
+        if len(route_sequence) < 2:
+            return True
+        
+        # Sequence is sorted by start time; adjacent checks are sufficient.
+        for idx in range(len(route_sequence) - 1):
+            left = route_sequence[idx]
+            right = route_sequence[idx + 1]
+            key = tuple(sorted((left.route_id, right.route_id)))
+            
+            if not self.route_pair_compatibility.get(
+                key,
+                not left.overlaps_with(right, self.turnaround_minutes)
+            ):
+                return False
+        
+        return True
+    
+    def _estimate_max_routes_to_combine(self) -> int:
+        """
+        Estimate practical upper bound for sequence length from route timing.
+        
+        Uses:
+        - average route duration
+        - earliest route start and latest route end in the current window
+        Then adds +1 as an edge-case buffer.
+        """
+        if not self.routes:
+            return 1
+        
+        earliest_start = min(r.plan_start_date_time for r in self.routes)
+        latest_end = max(r.plan_end_date_time for r in self.routes)
+        window_minutes = max(
+            1.0,
+            (latest_end - earliest_start).total_seconds() / 60.0
+        )
+        
+        avg_route_minutes = sum(r.duration_minutes for r in self.routes) / len(self.routes)
+        if avg_route_minutes <= 0:
+            return min(self.max_routes_per_vehicle, self.n_routes)
+        
+        estimated_max = int(window_minutes // avg_route_minutes) + 1
+        estimated_max = max(1, estimated_max)
+        
+        return min(self.max_routes_per_vehicle, self.n_routes, estimated_max)
     
     def generate_feasible_sequences(self, vehicle: Vehicle) -> List[Tuple[List[Route], float]]:
         """
@@ -161,12 +249,38 @@ class CostMatrixBuilder:
         
         # Multi-route sequences (up to max_routes_per_vehicle)
         multi_route_feasible = 0
-        for seq_length in range(2, min(self.max_routes_per_vehicle + 1, self.n_routes + 1)):
+        max_routes_to_combine = self._estimate_max_routes_to_combine()
+        logger.debug(
+            f"  Max routes to combine: {max_routes_to_combine} "
+            f"(config={self.max_routes_per_vehicle}, routes={self.n_routes})"
+        )
+        
+        for seq_length in range(2, max_routes_to_combine + 1):
             seq_length_feasible = 0
+            seq_length_processed = 0
+            total_combos_for_length = comb(self.n_routes, seq_length)
+            logger.debug(
+                f"  Starting sequences of length {seq_length}: "
+                f"{total_combos_for_length} combinations to evaluate"
+            )
             # Generate combinations of routes
             for route_combo in combinations(self.routes, seq_length):
-                # Sort by start time
-                route_sequence = sorted(route_combo, key=lambda r: r.plan_start_date_time)
+                seq_length_processed += 1
+                if (
+                    seq_length >= 3 and
+                    seq_length_processed % PROGRESS_LOG_EVERY_COMBINATIONS == 0
+                ):
+                    logger.debug(
+                        f"    Progress length {seq_length}: "
+                        f"{seq_length_processed}/{total_combos_for_length} processed, "
+                        f"{seq_length_feasible} feasible so far"
+                    )
+                # combinations(self.routes, ...) preserves order from self.routes.
+                route_sequence = list(route_combo)
+                
+                # Early prune overlap-infeasible sequences before full evaluation.
+                if not self._is_non_overlapping_sequence(route_sequence):
+                    continue
                 
                 # Evaluate sequence
                 evaluation = self.constraint_manager.evaluate_sequence(
@@ -188,6 +302,8 @@ class CostMatrixBuilder:
             
             if seq_length_feasible > 0:
                 logger.debug(f"  Sequences of length {seq_length}: {seq_length_feasible} feasible")
+            else:
+                logger.debug(f"  Sequences of length {seq_length}: 0 feasible")
         
         logger.debug(f"  Multi-route sequences: {multi_route_feasible} total feasible")
         logger.debug(f"Vehicle {vehicle.vehicle_id}: {len(feasible_sequences)} total feasible sequences\n")

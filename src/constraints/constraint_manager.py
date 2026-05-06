@@ -4,7 +4,6 @@ from src.constraints.base import BaseConstraint
 from src.constraints.energy_feasibility import EnergyFeasibilityConstraint
 from src.constraints.turnaround_time import TurnaroundTimeStrictConstraint, TurnaroundTimePreferredConstraint
 from src.constraints.shift_hours import ShiftHoursStrictConstraint
-from src.constraints.route_overlap import RouteOverlapConstraint
 from src.constraints.charger_preference import ChargerPreferenceConstraint
 from src.models.vehicle import Vehicle
 from src.models.route import Route
@@ -37,16 +36,11 @@ class ConstraintManager:
             'turnaround_time_strict': TurnaroundTimeStrictConstraint,
             'turnaround_time_preferred': TurnaroundTimePreferredConstraint,
             'shift_hours_strict': ShiftHoursStrictConstraint,
-            'route_overlap': RouteOverlapConstraint,
             'charger_preference': ChargerPreferenceConstraint,
         }
         
         for name, constraint_class in constraint_classes.items():
             config = configs.get(name, {'enabled': True, 'params': {}, 'penalty': -20})
-
-            # Route overlap is always enabled (mandatory)
-            if name == 'route_overlap':
-                config['enabled'] = True
             
             constraint = constraint_class(config)
             self.constraints.append(constraint)
