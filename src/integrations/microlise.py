@@ -273,7 +273,7 @@ class MicroLiseClient:
         rows = db.execute_query(Queries.GET_ROUTES_FOR_DISPATCH) or []
         logger.info(f"Loaded {len(rows)} routes for dispatch")
 
-        print(f"Rows: {rows}")
+        # print(f"Rows: {rows}")
         print(f"Site ID: {site_id}")
         print(f"HTTP response: {[r['http_response'] not in (200, 201, -1) for r in rows]}")
 

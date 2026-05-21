@@ -112,7 +112,7 @@ class UnifiedController:
                 opt_mode, vehicles, vehicle_states, window_start, window_end, current_time
             )
 
-            logger.info(f"Opt inputs: {opt_inputs}")
+            # logger.info(f"Opt inputs: {opt_inputs}")
             
             # Phase 6: Run unified optimization
             if config is None:
