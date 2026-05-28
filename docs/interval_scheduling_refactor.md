@@ -189,10 +189,17 @@ None - maintained backward compatibility:
 - Same result formats (ChargeScheduleResult, VehicleChargeSchedule)
 - Converts interval solutions to 30-minute ChargeSlots
 
-### Removed Code
-- Old `_add_scheduling_constraints()` method (kept for reference but not called)
-- Old `_extract_scheduling_solution()` method (kept for reference but not called)
-- Time-slot variable creation code in both scheduling methods
+### Automatic Fallback Mechanism
+**NEW:** Added automatic detection and fallback for Hexaly versions without interval support:
+- Checks for `m.interval_var()` availability on initialization
+- Automatically uses time-slot approach if interval variables not available
+- Warns user: "Hexaly interval variables not available - using time-slot-based scheduling"
+- See [`docs/interval_fallback.md`](interval_fallback.md) for details
+
+### Preserved Code
+- Time-slot methods kept as fallback: `_solve_scheduling_only_timeslot()`, `_solve_integrated_timeslot()`
+- Original `_add_scheduling_constraints()` and `_extract_scheduling_solution()` used by fallback
+- Full functionality maintained on all Hexaly versions
 
 ### What Stayed
 - Allocation-only mode unchanged
@@ -200,6 +207,11 @@ None - maintained backward compatibility:
 - All model classes (Vehicle, Route, VehicleChargeState, etc.)
 - Database persistence logic
 - Controller integration
+
+### Version Requirements
+- **Interval Support:** Hexaly 14.0+ with scheduling features
+- **Fallback Support:** Any Hexaly version with basic operators
+- **Upgrade:** `pip install --upgrade hexaly>=14.0` to enable intervals
 
 ## Future Enhancements
 

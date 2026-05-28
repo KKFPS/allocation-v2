@@ -13,20 +13,20 @@ def main():
         epilog='''
 Examples:
   # Run integrated optimization (allocation + scheduling)
-  python unified_main.py --site-id 10 --mode integrated
+  python unified_main.py --site-id 10 --mode allocation charge_scheduling charger_allocation
   
   # Run allocation only
-  python unified_main.py --site-id 10 --mode allocation_only
+  python unified_main.py --site-id 10 --mode allocation
   
-  # Run scheduling only
-  python unified_main.py --site-id 10 --mode scheduling_only
+  # Run scheduling only (with charger allocation)
+  python unified_main.py --site-id 10 --mode charge_scheduling charger_allocation
   
   # Run with custom start time
-  python unified_main.py --site-id 10 --mode integrated \\
+  python unified_main.py --site-id 10 --mode allocation charge_scheduling \\
       --start-time "2026-02-16 04:30:00"
   
   # Run without database persistence
-  python unified_main.py --site-id 10 --mode integrated --no-persist
+  python unified_main.py --site-id 10 --mode allocation charge_scheduling --no-persist
         '''
     )
     
@@ -39,10 +39,14 @@ Examples:
     
     parser.add_argument(
         '--mode',
-        type=str,
-        default='integrated',
-        choices=['allocation_only', 'allocation', 'scheduling_only', 'scheduling', 'integrated', 'both'],
-        help='Optimization mode (default: integrated)'
+        nargs='+',
+        default=['allocation', 'charge_scheduling', 'charger_allocation'],
+        metavar='FLAG',
+        help=(
+            'Optimization flags (one or more): allocation, charge_scheduling, '
+            'charger_allocation. Legacy strings integrated/allocation_only/scheduling_only '
+            'also accepted as a single value.'
+        ),
     )
     
     parser.add_argument(
@@ -86,12 +90,13 @@ Examples:
     )
     
     try:
-        logger.info(f"Starting unified optimization for site {args.site_id} in {args.mode} mode")
+        mode_input = args.mode if len(args.mode) > 1 else args.mode[0]
+        logger.info(f"Starting unified optimization for site {args.site_id}, mode={args.mode}")
         
         # Run optimization
         allocation_result, schedule_result, unified_result = controller.run_unified_optimization(
             current_time=start_time,
-            mode=args.mode,
+            mode=mode_input,
             config=None,  # Uses defaults
             persist_to_database=not args.no_persist
         )
@@ -101,20 +106,24 @@ Examples:
         print("UNIFIED OPTIMIZATION COMPLETED")
         print("="*70)
         print(f"Site ID:          {args.site_id}")
-        print(f"Mode:             {args.mode}")
+        from src.optimizer.unified_optimizer import normalize_mode_input, resolve_optimization_from_modes
+        mode_flags = normalize_mode_input(mode_input)
+        opt_mode, _ = resolve_optimization_from_modes(mode_flags)
+        print(f"Mode:             {mode_flags}")
+        print(f"Solver mode:      {opt_mode.value}")
         print(f"Status:           {unified_result.status}")
         print(f"Objective Value:  {unified_result.objective_value:.2f}")
         print(f"Solve Time:       {unified_result.solve_time_seconds:.2f}s")
         
         # Allocation metrics
-        if args.mode in ['allocation_only', 'allocation', 'integrated', 'both']:
+        if 'allocation' in mode_flags:
             print("\nALLOCATION RESULTS:")
             print(f"  Routes Allocated: {unified_result.routes_allocated}/{unified_result.routes_total}")
             print(f"  Allocation Score: {unified_result.allocation_score:.2f}")
             print(f"  Allocation ID:    {controller.allocation_id}")
         
         # Scheduling metrics
-        if args.mode in ['scheduling_only', 'scheduling', 'integrated', 'both']:
+        if 'charge_scheduling' in mode_flags:
             print("\nSCHEDULING RESULTS:")
             print(f"  Total Energy:     {unified_result.total_energy_kwh:.2f} kWh")
             print(f"  Total Cost:       £{unified_result.total_charging_cost:.2f}")

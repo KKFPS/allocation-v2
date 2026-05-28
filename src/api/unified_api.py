@@ -12,7 +12,7 @@ Examples:
   # Run unified optimization
   curl -X POST http://localhost:8000/optimize/unified \\
     -H "Content-Type: application/json" \\
-    -d '{"site_id": 10, "test_start_time": "2026-02-16 04:30:00", "mode": "integrated"}'
+    -d '{"site_id": 10, "test_start_time": "2026-02-16 04:30:00", "mode": ["allocation", "charge_scheduling", "charger_allocation"]}'
 
   # Get schedule report (timestamp optional; default is now)
   curl "http://localhost:8000/report/schedule?schedule_id=1"
@@ -23,7 +23,7 @@ from datetime import datetime
 from enum import Enum
 from src.utils.logging_config import logger
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, validator
@@ -31,22 +31,31 @@ from pydantic import BaseModel, Field, validator
 from src.controllers.unified_controller import UnifiedController
 from src.integrations.microlise import MicroLiseClient, MicroLiseParams
 from src.optimizer.unified_optimizer import (
-    OptimizationMode,
+    MODE_FLAG_ALLOCATION,
+    MODE_FLAG_CHARGE_SCHEDULING,
+    MODE_FLAG_CHARGER_ALLOCATION,
     UnifiedOptimizationConfig,
+    normalize_mode_input,
+    resolve_optimization_from_modes,
 )
 
 print("Unified API loaded")
 
 
-class OptimizationModeRequest(str, Enum):
-    """Allowed optimization mode values for API requests."""
+class OptimizationModeFlag(str, Enum):
+    """Allowed optimization mode flags for API requests (mode array items)."""
 
-    allocation_only = "allocation_only"
-    allocation = "allocation"
-    scheduling_only = "scheduling_only"
-    scheduling = "scheduling"
-    integrated = "integrated"
-    both = "both"
+    allocation = MODE_FLAG_ALLOCATION
+    charge_scheduling = MODE_FLAG_CHARGE_SCHEDULING
+    charger_allocation = MODE_FLAG_CHARGER_ALLOCATION
+
+
+def _default_mode_flags() -> List[OptimizationModeFlag]:
+    return [
+        OptimizationModeFlag.allocation,
+        OptimizationModeFlag.charge_scheduling,
+        OptimizationModeFlag.charger_allocation,
+    ]
 
 
 class MicroliseConnectionType(str, Enum):
@@ -75,9 +84,14 @@ class UnifiedOptimizationRequest(BaseModel):
         ),
     )
 
-    mode: OptimizationModeRequest = Field(
-        OptimizationModeRequest.integrated,
-        description="Optimization mode: allocation_only, scheduling_only, integrated",
+    mode: List[OptimizationModeFlag] = Field(
+        default_factory=_default_mode_flags,
+        description=(
+            "Optimization capabilities to run. "
+            "'allocation' = route-to-vehicle assignment; "
+            "'charge_scheduling' = charge schedule optimization; "
+            "'charger_allocation' = assign vehicles to charger power classes (requires charge_scheduling)."
+        ),
     )
     persist_to_database: bool = Field(True, description="Whether to persist results to DB")
 
@@ -102,7 +116,10 @@ class UnifiedOptimizationRequest(BaseModel):
     site_capacity_kw: Optional[float] = Field(None, ge=0, description="Site capacity in kW")
     enable_charger_allocation: Optional[bool] = Field(
         None,
-        description="Enable charger allocation constraints (default: True). When False, ignores site chargers and skips constraints C1-C5."
+        description=(
+            "Override charger allocation constraints. "
+            "If omitted, enabled when 'charger_allocation' is in mode."
+        ),
     )
 
     # Microlise TMS integration
@@ -188,41 +205,80 @@ class UnifiedOptimizationRequest(BaseModel):
                 "Use ISO 8601 (e.g. 2026-02-16T04:30:00) or 'YYYY-MM-DD HH:MM:SS'."
             ) from exc
 
+    @validator("mode", pre=True)
+    def _validate_mode(cls, value):
+        """Accept mode as array of flags or legacy single string."""
+        if value is None:
+            return [
+                OptimizationModeFlag.allocation,
+                OptimizationModeFlag.charge_scheduling,
+                OptimizationModeFlag.charger_allocation,
+            ]
+        if isinstance(value, str):
+            flags = normalize_mode_input(value)
+            return [OptimizationModeFlag(f) for f in flags]
+        if isinstance(value, list):
+            normalized = []
+            for item in value:
+                if isinstance(item, OptimizationModeFlag):
+                    normalized.append(item)
+                elif isinstance(item, str):
+                    flag = item.strip().lower()
+                    normalized.append(OptimizationModeFlag(flag))
+                else:
+                    normalized.append(OptimizationModeFlag(str(item)))
+            # Deduplicate while preserving order
+            seen = set()
+            unique = []
+            for flag in normalized:
+                if flag not in seen:
+                    seen.add(flag)
+                    unique.append(flag)
+            resolve_optimization_from_modes([f.value for f in unique])
+            return unique
+        raise ValueError(
+            "mode must be an array of flags: allocation, charge_scheduling, charger_allocation"
+        )
 
-def _build_config_from_request(req: UnifiedOptimizationRequest) -> Optional[UnifiedOptimizationConfig]:
-    """Build UnifiedOptimizationConfig from request overrides; None if no overrides."""
-    mode_str = req.mode.value
-    mode_map = {
-        "allocation_only": OptimizationMode.ALLOCATION_ONLY,
-        "allocation": OptimizationMode.ALLOCATION_ONLY,
-        "scheduling_only": OptimizationMode.SCHEDULING_ONLY,
-        "scheduling": OptimizationMode.SCHEDULING_ONLY,
-        "integrated": OptimizationMode.INTEGRATED,
-        "both": OptimizationMode.INTEGRATED,
-    }
-    mode = mode_map.get(mode_str, OptimizationMode.INTEGRATED)
 
-    # Check if any config override was provided
-    overrides = [
-        req.allocation_time_limit,
-        req.scheduling_time_limit,
-        req.integrated_time_limit,
-        req.route_count_weight,
-        req.allocation_score_weight,
-        req.scheduling_cost_weight,
-        req.target_soc_shortfall_penalty,
-        req.triad_penalty_factor,
-        req.synthetic_time_price_factor,
-        req.target_soc_percent,
-        req.site_capacity_kw,
-        req.enable_charger_allocation,
-    ]
-    if all(o is None for o in overrides):
-        return None
+def _mode_flags_from_request(req: UnifiedOptimizationRequest) -> List[str]:
+    return [flag.value for flag in req.mode]
 
-    defaults = UnifiedOptimizationConfig(mode=mode)
+
+def _build_config_from_request(req: UnifiedOptimizationRequest) -> UnifiedOptimizationConfig:
+    """Build UnifiedOptimizationConfig from request mode flags and optional overrides."""
+    mode_flags = _mode_flags_from_request(req)
+    opt_mode, enable_charger_from_mode = resolve_optimization_from_modes(mode_flags)
+
+    if req.enable_charger_allocation is not None:
+        enable_charger_allocation = req.enable_charger_allocation
+    else:
+        enable_charger_allocation = enable_charger_from_mode
+
+    defaults = UnifiedOptimizationConfig(mode=opt_mode)
+    has_overrides = any([
+        req.allocation_time_limit is not None,
+        req.scheduling_time_limit is not None,
+        req.integrated_time_limit is not None,
+        req.route_count_weight is not None,
+        req.allocation_score_weight is not None,
+        req.scheduling_cost_weight is not None,
+        req.target_soc_shortfall_penalty is not None,
+        req.triad_penalty_factor is not None,
+        req.synthetic_time_price_factor is not None,
+        req.target_soc_percent is not None,
+        req.site_capacity_kw is not None,
+        req.enable_charger_allocation is not None,
+    ])
+
+    if not has_overrides and enable_charger_allocation == defaults.enable_charger_allocation:
+        return UnifiedOptimizationConfig(
+            mode=opt_mode,
+            enable_charger_allocation=enable_charger_allocation,
+        )
+
     return UnifiedOptimizationConfig(
-        mode=mode,
+        mode=opt_mode,
         allocation_time_limit=req.allocation_time_limit if req.allocation_time_limit is not None else defaults.allocation_time_limit,
         scheduling_time_limit=req.scheduling_time_limit if req.scheduling_time_limit is not None else defaults.scheduling_time_limit,
         integrated_time_limit=req.integrated_time_limit if req.integrated_time_limit is not None else defaults.integrated_time_limit,
@@ -234,7 +290,7 @@ def _build_config_from_request(req: UnifiedOptimizationRequest) -> Optional[Unif
         synthetic_time_price_factor=req.synthetic_time_price_factor if req.synthetic_time_price_factor is not None else defaults.synthetic_time_price_factor,
         target_soc_percent=req.target_soc_percent if req.target_soc_percent is not None else defaults.target_soc_percent,
         site_capacity_kw=req.site_capacity_kw if req.site_capacity_kw is not None else defaults.site_capacity_kw,
-        enable_charger_allocation=req.enable_charger_allocation if req.enable_charger_allocation is not None else defaults.enable_charger_allocation,
+        enable_charger_allocation=enable_charger_allocation,
     )
 
 
@@ -310,7 +366,7 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
     try:
         allocation_result, schedule_result, unified_result = controller.run_unified_optimization(
             current_time=current_time,
-            mode=body.mode.value,
+            mode=_mode_flags_from_request(body),
             config=config,
             persist_to_database=body.persist_to_database,
             window_hours=body.window_hours,
@@ -322,6 +378,7 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
 
     response: Dict[str, Any] = {
         "success": True,
+        "mode": _mode_flags_from_request(body),
         "unified_result": _result_to_jsonable(unified_result),
         "allocation_id": getattr(controller, "allocation_id", None),
         "schedule_id": getattr(controller, "schedule_id", None),

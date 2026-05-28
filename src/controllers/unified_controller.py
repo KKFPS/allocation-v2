@@ -1,7 +1,7 @@
 """Unified controller - orchestrates combined allocation and scheduling optimization."""
 
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 from src.database.connection import db
 from src.database.queries import Queries
 from src.models.vehicle import Vehicle
@@ -16,7 +16,12 @@ from src.maf.parameter_parser import parse_maf_response, get_site_parameter, get
 from src.constraints.constraint_manager import ConstraintManager
 from src.optimizer.cost_matrix import CostMatrixBuilder
 from src.optimizer.unified_optimizer import (
-    UnifiedOptimizer, UnifiedOptimizationConfig, UnifiedOptimizationResult, OptimizationMode
+    UnifiedOptimizer,
+    UnifiedOptimizationConfig,
+    UnifiedOptimizationResult,
+    OptimizationMode,
+    normalize_mode_input,
+    resolve_optimization_from_modes,
 )
 from src.config import (
     APPLICATION_NAME, DEFAULT_ALLOCATION_WINDOW_HOURS,
@@ -52,7 +57,7 @@ class UnifiedController:
     def run_unified_optimization(
         self,
         current_time: Optional[datetime] = None,
-        mode: str = 'integrated',
+        mode: Union[str, List[str]] = None,
         config: Optional[UnifiedOptimizationConfig] = None,
         persist_to_database: bool = True,
         window_hours: Optional[float] = None
@@ -62,7 +67,8 @@ class UnifiedController:
         
         Args:
             current_time: Current datetime (defaults to now)
-            mode: Optimization mode ('allocation_only', 'scheduling_only', 'integrated')
+            mode: Mode flags array ('allocation', 'charge_scheduling', 'charger_allocation')
+                  or legacy single string (allocation_only, scheduling_only, integrated)
             config: Optional optimization configuration
             persist_to_database: Whether to persist results to database
             window_hours: Optional planning window length in hours (overrides site/MAF default)
@@ -76,10 +82,14 @@ class UnifiedController:
         # Floor to 30-minute interval for scheduling consistency
         current_time = self._floor_to_30_min(current_time)
         
-        # Parse mode
-        opt_mode = self._parse_mode(mode)
+        # Parse mode flags -> OptimizationMode + charger allocation
+        opt_mode, enable_charger_allocation = self._parse_mode(mode)
         
-        logger.info(f"Starting unified optimization for site {self.site_id}, mode={opt_mode.value}")
+        logger.info(
+            f"Starting unified optimization for site {self.site_id}, "
+            f"mode_flags={normalize_mode_input(mode)}, solver_mode={opt_mode.value}, "
+            f"charger_allocation={enable_charger_allocation}"
+        )
         
         try:
             # Phase 1: Initialization
@@ -117,6 +127,9 @@ class UnifiedController:
             # Phase 6: Run unified optimization
             if config is None:
                 config = self._build_optimization_config(opt_mode)
+            else:
+                config.mode = opt_mode
+            config.enable_charger_allocation = enable_charger_allocation
             
             optimizer = UnifiedOptimizer(config)
             unified_result = optimizer.solve(**opt_inputs)
@@ -185,23 +198,17 @@ class UnifiedController:
         minute = (dt.minute // 30) * 30
         return dt.replace(minute=minute, second=0, microsecond=0)
     
-    def _parse_mode(self, mode: str) -> OptimizationMode:
-        """Parse mode string to OptimizationMode enum."""
-        mode_map = {
-            'allocation_only': OptimizationMode.ALLOCATION_ONLY,
-            'allocation': OptimizationMode.ALLOCATION_ONLY,
-            'scheduling_only': OptimizationMode.SCHEDULING_ONLY,
-            'scheduling': OptimizationMode.SCHEDULING_ONLY,
-            'integrated': OptimizationMode.INTEGRATED,
-            'both': OptimizationMode.INTEGRATED
-        }
-        
-        mode_lower = mode.lower()
-        if mode_lower not in mode_map:
-            raise ValueError(f"Invalid optimization mode: {mode}. "
-                           f"Must be one of: {list(mode_map.keys())}")
-        
-        return mode_map[mode_lower]
+    def _parse_mode(
+        self, mode: Union[str, List[str], None]
+    ) -> Tuple[OptimizationMode, bool]:
+        """
+        Parse mode input to OptimizationMode and enable_charger_allocation.
+
+        mode may be a list of flags (allocation, charge_scheduling, charger_allocation)
+        or a legacy single string.
+        """
+        mode_flags = normalize_mode_input(mode)
+        return resolve_optimization_from_modes(mode_flags)
     
     def _initialize_optimization(
         self, current_time: datetime, mode: OptimizationMode,
