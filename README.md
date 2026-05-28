@@ -38,6 +38,8 @@ cp .env.example .env
 
 Run API using uvicorn src.api.unified_api:app --reload --host 0.0.0.0 --port 8000
 ```bash
+http://localhost:8000/optimize/unified
+
 {
 	"site_id": 513,
 	"mode": ["charge_scheduling", "charger_allocation"],
