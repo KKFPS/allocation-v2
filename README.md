@@ -36,20 +36,20 @@ cp .env.example .env
 
 3. Run systems:
 
+Run API using uvicorn src.api.unified_api:app --reload --host 0.0.0.0 --port 8000
 ```bash
-# Allocation only
-python main.py --site-id 10
+{
+	"site_id": 513,
+	"mode": ["charge_scheduling", "charger_allocation"],
+	"allocation_score_weight": 2.0,
+	"test_start_time": "2026-03-21 00:00:00",
+	"scheduling_cost_weight": 0.5,
+	"window_hours": 24,
+	"persist_to_database": true,
+	"microlise_enabled": false,
+	"microlise_simulate": false
+}
 
-# Scheduling only
-python scheduler_main.py --site-id 10
-
-# Integrated workflow (allocation + scheduling) - LEGACY
-python integrated_main.py --site-id 10
-
-# Unified controller (RECOMMENDED) - Single optimization model
-python unified_main.py --site-id 10 --mode integrated
-python unified_main.py --site-id 10 --mode allocation_only
-python unified_main.py --site-id 10 --mode scheduling_only
 ```
 
 ## Unified Controller (NEW)
@@ -67,20 +67,6 @@ The unified controller provides a single optimization model that can run:
 - Unified database persistence
 
 ### Usage
-
-```bash
-# Integrated optimization (both allocation and scheduling)
-python unified_main.py --site-id 10 --mode integrated
-
-# Allocation only
-python unified_main.py --site-id 10 --mode allocation_only
-
-# Scheduling only (requires pre-allocated routes)
-python unified_main.py --site-id 10 --mode scheduling_only
-
-# Custom start time
-python unified_main.py --site-id 10 --mode integrated --start-time "2026-02-16 04:30:00"
-```
 
 ### Testing
 
