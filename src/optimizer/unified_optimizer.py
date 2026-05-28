@@ -138,6 +138,11 @@ class UnifiedOptimizationConfig:
     """Configuration for unified optimization."""
     
     mode: OptimizationMode = OptimizationMode.INTEGRATED
+    mode_flags: List[str] = field(default_factory=lambda: [
+        MODE_FLAG_ALLOCATION,
+        MODE_FLAG_CHARGE_SCHEDULING,
+        MODE_FLAG_CHARGER_ALLOCATION,
+    ])
     
     # Time limits (seconds)
     allocation_time_limit: int = 30
@@ -172,7 +177,7 @@ class UnifiedOptimizationConfig:
 class UnifiedOptimizationResult:
     """Result from unified optimization."""
     
-    mode: OptimizationMode
+    mode: List[str]
     status: str
     solve_time_seconds: float
     
@@ -267,31 +272,23 @@ class UnifiedOptimizer:
             config: Optimization configuration. Uses defaults if not provided.
         """
         self.config = config or UnifiedOptimizationConfig()
-        self._has_interval_support = self._check_interval_support()
-        
-        if not self._has_interval_support:
-            logger.warning(
-                "[UNIFIED] Hexaly interval variables not available - "
-                "using time-slot-based scheduling. "
-                "For interval support, upgrade to Hexaly 14.0+ with scheduling features."
-            )
-    
-    def _check_interval_support(self) -> bool:
-        """Check if Hexaly supports interval variables."""
-        try:
-            with hx.HexalyOptimizer() as optimizer:
-                model = optimizer.model
-                # Try to access interval_var method
-                return hasattr(model, 'interval_var')
-        except:
-            return False
     
     def solve(
         self,
-        # Allocation inputs
+        mode_flags: Optional[List[str]] = None,
+        # Legacy allocation inputs
         sequences: Optional[List[Tuple]] = None,
         route_ids: Optional[List[str]] = None,
         sequence_costs: Optional[np.ndarray] = None,
+        # List-based allocation inputs
+        allocation_routes: Optional[List[Route]] = None,
+        score_vr: Optional[np.ndarray] = None,
+        feasible_vr: Optional[np.ndarray] = None,
+        route_start_times: Optional[np.ndarray] = None,
+        route_end_times: Optional[np.ndarray] = None,
+        route_durations: Optional[np.ndarray] = None,
+        route_energy_required: Optional[np.ndarray] = None,
+        allocation_metadata: Optional[Dict[str, Any]] = None,
         # Scheduling inputs
         schedule_id: Optional[int] = None,
         vehicles: Optional[List[Vehicle]] = None,
@@ -328,18 +325,50 @@ class UnifiedOptimizer:
         Returns:
             UnifiedOptimizationResult with allocation and/or scheduling outputs
         """
-        # Determine effective mode
-        mode = self._determine_mode(
-            sequences, route_ids, vehicles, time_slots,
-            fix_allocation, fix_scheduling
+        # Determine effective mode flags
+        configured_flags = mode_flags
+        if configured_flags is None:
+            configured_flags = getattr(self.config, "mode_flags", None)
+        if configured_flags is None:
+            configured_flags = normalize_mode_input(getattr(self.config, "mode", None))
+        active_mode_flags = normalize_mode_input(configured_flags)
+
+        if fix_allocation is not None:
+            active_mode_flags = [MODE_FLAG_CHARGE_SCHEDULING]
+        if fix_scheduling:
+            active_mode_flags = [MODE_FLAG_ALLOCATION]
+
+        run_allocation = MODE_FLAG_ALLOCATION in active_mode_flags
+        run_scheduling = MODE_FLAG_CHARGE_SCHEDULING in active_mode_flags
+        self.config.enable_charger_allocation = (
+            self.config.enable_charger_allocation
+            and MODE_FLAG_CHARGER_ALLOCATION in active_mode_flags
+            and run_scheduling
         )
+
+        legacy_sequences = sequences
+        legacy_route_ids = route_ids
+        legacy_sequence_costs = sequence_costs
+        if (
+            legacy_sequences is None
+            and score_vr is not None
+            and allocation_routes is not None
+            and vehicles is not None
+        ):
+            legacy_sequence_costs, legacy_sequences = self._legacy_sequences_from_pair_scores(
+                vehicles=vehicles,
+                routes=allocation_routes,
+                score_vr=score_vr,
+                feasible_vr=feasible_vr,
+            )
+            legacy_route_ids = [route.route_id for route in allocation_routes]
         
         if DEBUG_EXPORT_UNIFIED_MATRICES_CSV:
             export_unified_debug_matrices_csv(
                 self.config,
-                sequences=sequences,
-                route_ids=route_ids,
-                sequence_costs=sequence_costs,
+                sequences=legacy_sequences,
+                route_ids=legacy_route_ids,
+                sequence_costs=legacy_sequence_costs,
                 vehicles=vehicles,
                 vehicle_states=vehicle_states,
                 energy_requirements=energy_requirements,
@@ -349,56 +378,63 @@ class UnifiedOptimizer:
                 price_data=price_data,
             )
         
-        logger.info(f"[UNIFIED] Starting optimization in mode: {mode.value}")
+        logger.info(f"[UNIFIED] Starting optimization with mode flags: {active_mode_flags}")
         
         if not IS_HEXALY_ACTIVE:
             logger.warning("Hexaly not active - using greedy fallback")
             return self._greedy_fallback(
-                mode, sequences, route_ids, sequence_costs,
+                active_mode_flags, legacy_sequences, legacy_route_ids, legacy_sequence_costs,
                 schedule_id, vehicles, vehicle_states, energy_requirements,
                 availability_matrices, time_slots, price_data,
                 fix_allocation
             )
         
         try:
-            if mode == OptimizationMode.ALLOCATION_ONLY:
-                return self._solve_allocation_only(
-                    sequences, route_ids, sequence_costs
+            if run_allocation and not run_scheduling:
+                result = self._solve_allocation_only(
+                    vehicles=vehicles or [],
+                    routes=allocation_routes or [],
+                    score_vr=score_vr if score_vr is not None else np.zeros((0, 0)),
+                    feasible_vr=feasible_vr if feasible_vr is not None else np.zeros((0, 0), dtype=bool),
+                    route_start_times=route_start_times if route_start_times is not None else np.array([]),
+                    route_end_times=route_end_times if route_end_times is not None else np.array([]),
+                    allocation_metadata=allocation_metadata or {},
                 )
-            elif mode == OptimizationMode.SCHEDULING_ONLY:
-                # Use time-slot method if interval variables not available
-                if not self._has_interval_support:
-                    return self._solve_scheduling_only_timeslot(
-                        schedule_id, vehicles, vehicle_states, energy_requirements,
-                        availability_matrices, time_slots, forecast_data, price_data,
-                        site_chargers, fix_allocation
-                    )
-                else:
-                    return self._solve_scheduling_only(
-                        schedule_id, vehicles, vehicle_states, energy_requirements,
-                        availability_matrices, time_slots, forecast_data, price_data,
-                        site_chargers, fix_allocation
-                    )
-            else:  # INTEGRATED
-                # Use time-slot method if interval variables not available
-                if not self._has_interval_support:
-                    return self._solve_integrated_timeslot(
-                        sequences, route_ids, sequence_costs,
-                        schedule_id, vehicles, vehicle_states, energy_requirements,
-                        availability_matrices, time_slots, forecast_data, price_data,
-                        site_chargers
-                    )
-                else:
-                    return self._solve_integrated(
-                        sequences, route_ids, sequence_costs,
-                        schedule_id, vehicles, vehicle_states, energy_requirements,
-                        availability_matrices, time_slots, forecast_data, price_data,
-                        site_chargers
-                    )
+                result.mode = active_mode_flags
+                return result
+            elif run_scheduling and not run_allocation:
+                result = self._solve_scheduling_only(
+                    schedule_id, vehicles, vehicle_states, energy_requirements,
+                    availability_matrices, time_slots, forecast_data, price_data,
+                    site_chargers, fix_allocation
+                )
+                result.mode = active_mode_flags
+                return result
+            else:
+                result = self._solve_integrated(
+                    vehicles=vehicles,
+                    routes=allocation_routes or [],
+                    score_vr=score_vr if score_vr is not None else np.zeros((0, 0)),
+                    feasible_vr=feasible_vr if feasible_vr is not None else np.zeros((0, 0), dtype=bool),
+                    route_start_times=route_start_times if route_start_times is not None else np.array([]),
+                    route_end_times=route_end_times if route_end_times is not None else np.array([]),
+                    route_durations=route_durations if route_durations is not None else np.array([]),
+                    allocation_metadata=allocation_metadata or {},
+                    schedule_id=schedule_id,
+                    vehicle_states=vehicle_states,
+                    energy_requirements=energy_requirements,
+                    availability_matrices=availability_matrices,
+                    time_slots=time_slots,
+                    forecast_data=forecast_data,
+                    price_data=price_data,
+                    site_chargers=site_chargers,
+                )
+                result.mode = active_mode_flags
+                return result
         except Exception as e:
             logger.error(f"Unified optimization failed: {e}", exc_info=True)
             return self._greedy_fallback(
-                mode, sequences, route_ids, sequence_costs,
+                active_mode_flags, legacy_sequences, legacy_route_ids, legacy_sequence_costs,
                 schedule_id, vehicles, vehicle_states, energy_requirements,
                 availability_matrices, time_slots, price_data,
                 fix_allocation
@@ -408,6 +444,8 @@ class UnifiedOptimizer:
         self,
         sequences: Optional[List[Tuple]],
         route_ids: Optional[List[str]],
+        score_vr: Optional[np.ndarray],
+        allocation_routes: Optional[List[Route]],
         vehicles: Optional[List[Vehicle]],
         time_slots: Optional[List[datetime]],
         fix_allocation: Optional[List[Tuple]],
@@ -418,7 +456,9 @@ class UnifiedOptimizer:
         if self.config.mode != OptimizationMode.INTEGRATED:
             return self.config.mode
         
-        has_allocation_data = sequences is not None and route_ids is not None
+        has_legacy_allocation = sequences is not None and route_ids is not None
+        has_list_allocation = score_vr is not None and allocation_routes is not None
+        has_allocation_data = has_legacy_allocation or has_list_allocation
         has_scheduling_data = vehicles is not None and time_slots is not None
         
         # Fixed allocation -> scheduling only
@@ -441,96 +481,274 @@ class UnifiedOptimizer:
     
     def _solve_allocation_only(
         self,
-        sequences: List[Tuple],
-        route_ids: List[str],
-        sequence_costs: np.ndarray
+        vehicles: List[Vehicle],
+        routes: List[Route],
+        score_vr: np.ndarray,
+        feasible_vr: np.ndarray,
+        route_start_times: np.ndarray,
+        route_end_times: np.ndarray,
+        allocation_metadata: Dict[str, Any],
     ) -> UnifiedOptimizationResult:
-        """Solve allocation-only optimization."""
+        """Solve allocation-only optimization with native Hexaly list variables."""
         with hx.HexalyOptimizer() as optimizer:
             model = optimizer.model
-            
-            n_sequences = len(sequences)
-            n_routes = len(route_ids)
-            
-            logger.info(f"[UNIFIED:ALLOC] Building model: {n_sequences} sequences, {n_routes} routes")
-            
-            # Decision variables: binary selection for each sequence
-            sequence_vars = [model.bool() for _ in range(n_sequences)]
-            
-            # Build mappings
-            route_coverage = {route_id: [] for route_id in route_ids}
-            vehicle_to_sequences = {}
-            
-            for seq_idx, (vehicle_id, route_sequence, cost) in enumerate(sequences):
-                vehicle_to_sequences.setdefault(vehicle_id, []).append(seq_idx)
-                for route in route_sequence:
-                    if route.route_id in route_coverage:
-                        route_coverage[route.route_id].append(seq_idx)
-            
-            # Constraint: Each vehicle used by at most one sequence
-            for vehicle_id, seq_indices in vehicle_to_sequences.items():
-                model.constraint(
-                    model.sum([sequence_vars[i] for i in seq_indices]) <= 1
-                )
-            
-            # Route coverage constraints and variables
-            route_covered_vars = {}
-            for route_id in route_ids:
-                covering_sequences = route_coverage[route_id]
-                if covering_sequences:
-                    coverage_sum = model.sum([sequence_vars[idx] for idx in covering_sequences])
-                    model.constraint(coverage_sum <= 1)
-                    
-                    route_covered = model.bool()
-                    route_covered_vars[route_id] = route_covered
-                    model.constraint(route_covered <= coverage_sum)
-                    model.constraint(coverage_sum <= len(covering_sequences) * route_covered)
-            
-            # Objective: maximize routes covered + scores
-            score_term = model.sum([
-                sequence_vars[i] * float(sequence_costs[i]) 
-                for i in range(n_sequences)
-            ])
-            
-            if route_covered_vars:
-                route_count_term = model.sum(list(route_covered_vars.values()))
-                objective = self.config.route_count_weight * route_count_term + score_term
-            else:
-                objective = score_term
-            
+
+            routes_by_vehicle, score_term = self._build_list_allocation_block(
+                model=model,
+                vehicles=vehicles,
+                routes=routes,
+                score_vr=score_vr,
+                feasible_vr=feasible_vr,
+                route_start_times=route_start_times,
+                route_end_times=route_end_times,
+                allocation_metadata=allocation_metadata,
+            )
+
+            route_count_term = model.sum([model.count(lst) for lst in routes_by_vehicle])
+            objective = self.config.route_count_weight * route_count_term + score_term
             model.maximize(objective)
             model.close()
-            
-            # Solve
+
             optimizer.param.time_limit = self.config.allocation_time_limit
             optimizer.solve()
-            
-            # Extract solution
-            selected_indices = [i for i in range(n_sequences) if sequence_vars[i].value == 1]
-            selected_sequences = [sequences[i] for i in selected_indices]
-            total_score = sum(sequences[i][2] for i in selected_indices)
-            routes_allocated = sum(
-                1 for r in route_covered_vars if route_covered_vars[r].value == 1
+
+            selected_sequences = self._extract_list_allocation_solution(
+                routes_by_vehicle=routes_by_vehicle,
+                vehicles=vehicles,
+                routes=routes,
+                score_vr=score_vr,
+                solution=optimizer.solution,
             )
-            
+            total_score = float(sum(seq[2] for seq in selected_sequences))
+            routes_allocated = int(
+                sum(len(route_sequence) for _, route_sequence, _ in selected_sequences)
+            )
+
             solve_time = optimizer.statistics.running_time
             status = 'optimal' if optimizer.solution.status == hx.HxSolutionStatus.OPTIMAL else 'feasible'
-            
             logger.info(
-                f"[UNIFIED:ALLOC] Complete: {len(selected_sequences)} sequences, "
-                f"{routes_allocated}/{n_routes} routes, score={total_score:.2f}"
+                f"[UNIFIED:ALLOC] Complete: {len(selected_sequences)} vehicles with assignments, "
+                f"{routes_allocated}/{len(routes)} routes, score={total_score:.2f}"
             )
-            
+
             return UnifiedOptimizationResult(
-                mode=OptimizationMode.ALLOCATION_ONLY,
+                mode=[MODE_FLAG_ALLOCATION],
                 status=status,
                 solve_time_seconds=solve_time,
                 selected_sequences=selected_sequences,
                 allocation_score=total_score,
                 routes_allocated=routes_allocated,
-                routes_total=n_routes,
+                routes_total=len(routes),
                 objective_value=total_score
             )
+
+    def _build_list_allocation_block(
+        self,
+        model,
+        vehicles: List[Vehicle],
+        routes: List[Route],
+        score_vr: np.ndarray,
+        feasible_vr: np.ndarray,
+        route_start_times: np.ndarray,
+        route_end_times: np.ndarray,
+        allocation_metadata: Dict[str, Any],
+    ):
+        """Build native list allocation variables/constraints and return score term."""
+        n_vehicles = len(vehicles)
+        n_routes = len(routes)
+        routes_by_vehicle = [model.list(n_routes) for _ in range(n_vehicles)]
+        score_array = model.array(score_vr)
+        route_start_array = model.array(route_start_times)
+        route_end_array = model.array(route_end_times)
+
+        # Do NOT force full partition: some routes can be globally infeasible.
+        # We enforce "at most one vehicle per route" and maximize assigned count.
+        if n_routes > 0:
+            for r_idx in range(n_routes):
+                model.constraint(
+                    model.sum([model.contains(route_list, r_idx) for route_list in routes_by_vehicle]) <= 1
+                )
+
+        turnaround_minutes = float(allocation_metadata.get("turnaround_minutes", 0))
+        shift_max_minutes = float(allocation_metadata.get("shift_max_minutes", 16 * 60))
+        max_routes_per_vehicle = int(
+            allocation_metadata.get("max_routes_per_vehicle", max(1, n_routes))
+        )
+        standard_turnaround, optimal_turnaround, penalty_standard, penalty_optimal = allocation_metadata.get(
+            "turnaround_preferred", (75, 90, -2.0, -1.0)
+        )
+
+        # Vehicle route count and route membership feasibility.
+        for v_idx, route_list in enumerate(routes_by_vehicle):
+            model.constraint(model.count(route_list) <= max_routes_per_vehicle)
+            for r_idx in range(n_routes):
+                if feasible_vr.size and not bool(feasible_vr[v_idx, r_idx]):
+                    model.constraint(model.contains(route_list, r_idx) == 0)
+
+            # Strict turnaround between consecutive routes.
+            for i in range(1, n_routes):
+                prev_route_idx = route_list[i - 1]
+                curr_route_idx = route_list[i]
+                gap_expr = model.at(route_start_array, curr_route_idx) - model.at(
+                    route_end_array, prev_route_idx
+                )
+                model.constraint(
+                    model.iif(
+                        i < model.count(route_list),
+                        gap_expr >= turnaround_minutes,
+                        1,
+                    )
+                    == 1
+                )
+
+            # Strict shift-hours cap.
+            if n_routes > 0:
+                shift_duration_expr = model.at(
+                    route_end_array, route_list[model.count(route_list) - 1]
+                ) - model.at(route_start_array, route_list[0])
+                model.constraint(
+                    model.iif(
+                        model.count(route_list) > 0,
+                        shift_duration_expr <= shift_max_minutes,
+                        1,
+                    )
+                    == 1
+                )
+
+        # Score includes per-route base score + preferred turnaround soft penalties.
+        route_score_terms = []
+        preferred_turnaround_terms = []
+        for v_idx, route_list in enumerate(routes_by_vehicle):
+            route_score_terms.append(
+                model.sum(
+                    route_list,
+                    model.lambda_function(
+                        # In this Hexaly runtime, lambda arg over list is the element value.
+                        lambda route_idx: model.at(score_array, v_idx, route_idx)
+                    ),
+                )
+            )
+            for i in range(1, n_routes):
+                prev_route_idx = route_list[i - 1]
+                curr_route_idx = route_list[i]
+                gap_expr = model.at(route_start_array, curr_route_idx) - model.at(
+                    route_end_array, prev_route_idx
+                )
+                preferred_turnaround_terms.append(
+                    model.iif(
+                        i < model.count(route_list),
+                        model.iif(
+                            gap_expr < standard_turnaround,
+                            penalty_standard,
+                            model.iif(gap_expr < optimal_turnaround, penalty_optimal, 0.0),
+                        ),
+                        0.0,
+                    )
+                )
+
+        score_term = model.sum(route_score_terms) if route_score_terms else 0.0
+        if preferred_turnaround_terms:
+            score_term = score_term + model.sum(preferred_turnaround_terms)
+        return routes_by_vehicle, score_term
+
+    def _extract_list_indices(self, list_var, solution=None) -> List[int]:
+        """Extract integer values from a Hexaly list variable."""
+        _ = solution  # Kept for call-site compatibility across Hexaly versions.
+        solution_value = getattr(list_var, "value", None)
+        if isinstance(solution_value, (list, tuple)):
+            return [int(v) for v in solution_value]
+        # Some Hexaly versions expose list variables as HxExpression without list APIs
+        # when no feasible solution is available. Return empty assignment instead of raising.
+        return []
+
+    def _extract_list_allocation_solution(
+        self,
+        routes_by_vehicle: List,
+        vehicles: List[Vehicle],
+        routes: List[Route],
+        score_vr: np.ndarray,
+        solution=None,
+    ) -> List[Tuple]:
+        """Extract selected route lists into legacy selected_sequences format."""
+        selected_sequences: List[Tuple] = []
+        for v_idx, route_list in enumerate(routes_by_vehicle):
+            route_indices = self._extract_list_indices(route_list, solution=solution)
+            if not route_indices:
+                continue
+            assigned_routes = [routes[r_idx] for r_idx in route_indices]
+            seq_score = float(sum(score_vr[v_idx, r_idx] for r_idx in route_indices))
+            selected_sequences.append((vehicles[v_idx].vehicle_id, assigned_routes, seq_score))
+        return selected_sequences
+
+    def _legacy_sequences_from_pair_scores(
+        self,
+        vehicles: List[Vehicle],
+        routes: List[Route],
+        score_vr: np.ndarray,
+        feasible_vr: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, List[Tuple]]:
+        """Build legacy single-route sequence representation from pairwise scores."""
+        sequences: List[Tuple] = []
+        sequence_costs: List[float] = []
+        for v_idx, vehicle in enumerate(vehicles):
+            for r_idx, route in enumerate(routes):
+                if feasible_vr is not None and feasible_vr.size and not bool(feasible_vr[v_idx, r_idx]):
+                    continue
+                score = float(score_vr[v_idx, r_idx])
+                sequences.append((vehicle.vehicle_id, [route], score))
+                sequence_costs.append(score)
+        return np.array(sequence_costs, dtype=float), sequences
+
+    def _build_vehicle_charging_segments(
+        self,
+        vehicles: List[Vehicle],
+        energy_requirements: Dict[int, List[RouteEnergyRequirement]],
+        planning_start: datetime,
+        planning_horizon_minutes: int,
+    ) -> Dict[int, List[Tuple[int, int, str]]]:
+        """Build charging segments: pre-first, between-routes, post-last."""
+        segments_by_vehicle: Dict[int, List[Tuple[int, int, str]]] = {}
+
+        for vehicle in vehicles:
+            reqs = sorted(
+                energy_requirements.get(vehicle.vehicle_id, []),
+                key=lambda x: x.plan_start_date_time,
+            )
+            segments: List[Tuple[int, int, str]] = []
+            if not reqs:
+                segments.append((0, planning_horizon_minutes, "full_window"))
+                segments_by_vehicle[vehicle.vehicle_id] = segments
+                continue
+
+            first_start = int((reqs[0].plan_start_date_time - planning_start).total_seconds() / 60.0)
+            if first_start > 0:
+                segments.append((0, min(first_start, planning_horizon_minutes), "pre_first"))
+
+            for idx in range(len(reqs) - 1):
+                seg_start = int((reqs[idx].plan_end_date_time - planning_start).total_seconds() / 60.0)
+                seg_end = int((reqs[idx + 1].plan_start_date_time - planning_start).total_seconds() / 60.0)
+                if seg_end > seg_start:
+                    segments.append((max(0, seg_start), min(seg_end, planning_horizon_minutes), f"between_{idx}"))
+
+            last_end = int((reqs[-1].plan_end_date_time - planning_start).total_seconds() / 60.0)
+            if planning_horizon_minutes > last_end:
+                segments.append((max(0, last_end), planning_horizon_minutes, "post_last"))
+
+            # Filter zero/negative segments
+            segments_by_vehicle[vehicle.vehicle_id] = [
+                (s, e, label) for s, e, label in segments if e > s
+            ]
+        return segments_by_vehicle
+
+    def _segment_index_for_slot(
+        self,
+        segments: List[Tuple[int, int, str]],
+        slot_minute: int,
+    ) -> Optional[int]:
+        for idx, (start_min, end_min, _label) in enumerate(segments):
+            if start_min <= slot_minute < end_min:
+                return idx
+        return None
     
     def _solve_scheduling_only(
         self,
@@ -551,6 +769,22 @@ class UnifiedOptimizer:
             
             n_slots = len(time_slots)
             n_vehicles = len(vehicles)
+            planning_horizon_minutes = n_slots * 30
+            planning_start = time_slots[0] if time_slots else datetime.now()
+            segments_by_vehicle = self._build_vehicle_charging_segments(
+                vehicles=vehicles,
+                energy_requirements=energy_requirements,
+                planning_start=planning_start,
+                planning_horizon_minutes=planning_horizon_minutes,
+            )
+            planning_horizon_minutes = n_slots * 30
+            planning_start = time_slots[0] if time_slots else datetime.now()
+            segments_by_vehicle = self._build_vehicle_charging_segments(
+                vehicles=vehicles,
+                energy_requirements=energy_requirements,
+                planning_start=planning_start,
+                planning_horizon_minutes=planning_horizon_minutes,
+            )
             
             logger.info(
                 f"[UNIFIED:SCHED] Building model: {n_vehicles} vehicles, {n_slots} slots"
@@ -560,22 +794,37 @@ class UnifiedOptimizer:
             
             # Calculate planning horizon in minutes
             planning_horizon_minutes = n_slots * 30
+            planning_start = time_slots[0] if time_slots else datetime.now()
+            segments_by_vehicle = self._build_vehicle_charging_segments(
+                vehicles=vehicles,
+                energy_requirements=energy_requirements,
+                planning_start=planning_start,
+                planning_horizon_minutes=planning_horizon_minutes,
+            )
             
-            # Decision variables: Interval variables for charging sessions
+            # Decision variables: interval and charger choice per segment
             charging_sessions = []
             energy_charged = []
             power_class_choice = []
             
             for v_idx, vehicle in enumerate(vehicles):
                 state = vehicle_states.get(vehicle.vehicle_id)
+                vehicle_segments = segments_by_vehicle.get(vehicle.vehicle_id, [(0, planning_horizon_minutes, "full_window")])
+                vehicle_sessions = []
+                vehicle_energies = []
+                vehicle_choices = []
+
                 if not state:
-                    # Create dummy variables for vehicles without state
-                    session = model.interval_var(0, planning_horizon_minutes)
-                    session.duration_min = 0
-                    session.duration_max = 0
-                    charging_sessions.append(session)
-                    energy_charged.append(model.float(0, 0))
-                    power_class_choice.append(model.int(0, 0))
+                    for seg_start, seg_end, _label in vehicle_segments:
+                        session = model.interval_var(seg_start, seg_end)
+                        session.duration_min = 0
+                        session.duration_max = 0
+                        vehicle_sessions.append(session)
+                        vehicle_energies.append(model.float(0, 0))
+                        vehicle_choices.append(model.int(0, 0))
+                    charging_sessions.append(vehicle_sessions)
+                    energy_charged.append(vehicle_energies)
+                    power_class_choice.append(vehicle_choices)
                     continue
                 
                 # Calculate energy bounds
@@ -588,30 +837,28 @@ class UnifiedOptimizer:
                 else:
                     max_duration_minutes = 0
                 
-                # Create interval variable for charging session (optional)
-                session = model.interval_var(0, planning_horizon_minutes)
-                session.duration_min = 0  # Optional charging
-                session.duration_max = max_duration_minutes
-                charging_sessions.append(session)
-                
-                # Energy charged = charge_rate * (duration / 60)
-                # We model this as: energy_charged[v] <= charge_rate * length(session) / 60
-                energy = model.float(0, max_energy_needed)
-                if charge_rate_kw > 0:
-                    model.constraint(
-                        energy == (charge_rate_kw / 60.0) * model.length(session)
-                    )
-                else:
-                    model.constraint(energy == 0)
-                energy_charged.append(energy)
-                
-                # Power class choice (integer variable)
-                if site_chargers and self.config.enable_charger_allocation:
-                    n_charger_classes = len(site_chargers)
-                    choice = model.int(0, n_charger_classes - 1)
-                    power_class_choice.append(choice)
-                else:
-                    power_class_choice.append(model.int(0, 0))
+                for seg_start, seg_end, _label in vehicle_segments:
+                    session = model.interval_var(seg_start, seg_end)
+                    session.duration_min = 0
+                    session.duration_max = min(max_duration_minutes, max(0, seg_end - seg_start))
+                    vehicle_sessions.append(session)
+
+                    energy = model.float(0, max_energy_needed)
+                    if charge_rate_kw > 0:
+                        model.constraint(energy == (charge_rate_kw / 60.0) * model.length(session))
+                    else:
+                        model.constraint(energy == 0)
+                    vehicle_energies.append(energy)
+
+                    if site_chargers and self.config.enable_charger_allocation:
+                        n_charger_classes = len(site_chargers)
+                        vehicle_choices.append(model.int(0, n_charger_classes - 1))
+                    else:
+                        vehicle_choices.append(model.int(0, 0))
+
+                charging_sessions.append(vehicle_sessions)
+                energy_charged.append(vehicle_energies)
+                power_class_choice.append(vehicle_choices)
             
             if site_chargers and self.config.enable_charger_allocation:
                 n_charger_classes = len(site_chargers)
@@ -627,7 +874,7 @@ class UnifiedOptimizer:
             cost_terms = []
             for v_idx in range(n_vehicles):
                 # Cost = average_price * energy_charged
-                cost = avg_price * energy_charged[v_idx]
+                cost = avg_price * model.sum(energy_charged[v_idx]) if energy_charged[v_idx] else 0
                 cost_terms.append(cost)
             
             # Shortfall penalty (soft target SOC)
@@ -642,8 +889,9 @@ class UnifiedOptimizer:
                 
                 if max_shortfall > 0:
                     shortfall_v = model.float(0, max_shortfall)
+                    total_vehicle_energy = model.sum(energy_charged[v_idx]) if energy_charged[v_idx] else 0
                     model.constraint(
-                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - energy_charged[v_idx]
+                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - total_vehicle_energy
                     )
                     shortfall_terms.append(self.config.target_soc_shortfall_penalty * shortfall_v)
             
@@ -651,8 +899,8 @@ class UnifiedOptimizer:
             makespan_terms = []
             if self.config.makespan_penalty_weight > 0:
                 for v_idx in range(n_vehicles):
-                    if model.if_present(charging_sessions[v_idx]):
-                        makespan_terms.append(model.end(charging_sessions[v_idx]))
+                    for session in charging_sessions[v_idx]:
+                        makespan_terms.append(model.end(session))
             
             # Combine objective terms
             objective = model.sum(cost_terms)
@@ -669,7 +917,7 @@ class UnifiedOptimizer:
                 model, vehicles, vehicle_states, energy_requirements,
                 availability_matrices, time_slots, forecast_data,
                 charging_sessions, energy_charged, vehicle_to_idx, site_chargers,
-                power_class_choice, planning_horizon_minutes
+                power_class_choice, planning_horizon_minutes, segments_by_vehicle
             )
             
             model.close()
@@ -685,7 +933,7 @@ class UnifiedOptimizer:
             vehicle_schedules, total_cost, total_energy = self._extract_interval_solution(
                 schedule_id, vehicles, vehicle_states, energy_requirements,
                 availability_matrices, time_slots, price_data, charging_sessions, energy_charged, vehicle_to_idx,
-                site_chargers, power_class_choice, planning_horizon_minutes, model
+                site_chargers, power_class_choice, planning_horizon_minutes, model, segments_by_vehicle
             )
             
             logger.info(
@@ -694,7 +942,7 @@ class UnifiedOptimizer:
             )
             
             return UnifiedOptimizationResult(
-                mode=OptimizationMode.SCHEDULING_ONLY,
+                mode=[MODE_FLAG_CHARGE_SCHEDULING],
                 status=status,
                 solve_time_seconds=solve_time,
                 selected_sequences=fix_allocation or [],
@@ -706,11 +954,15 @@ class UnifiedOptimizer:
     
     def _solve_integrated(
         self,
-        sequences: List[Tuple],
-        route_ids: List[str],
-        sequence_costs: np.ndarray,
-        schedule_id: int,
         vehicles: List[Vehicle],
+        routes: List[Route],
+        score_vr: np.ndarray,
+        feasible_vr: np.ndarray,
+        route_start_times: np.ndarray,
+        route_end_times: np.ndarray,
+        route_durations: np.ndarray,
+        allocation_metadata: Dict[str, Any],
+        schedule_id: int,
         vehicle_states: Dict[int, VehicleChargeState],
         energy_requirements: Dict[int, List[RouteEnergyRequirement]],
         availability_matrices: Dict[int, VehicleAvailability],
@@ -727,54 +979,64 @@ class UnifiedOptimizer:
         """
         with hx.HexalyOptimizer() as optimizer:
             model = optimizer.model
-            
-            n_sequences = len(sequences)
-            n_routes = len(route_ids)
+
+            n_routes = len(routes)
             n_slots = len(time_slots)
             n_vehicles = len(vehicles)
-            
+            planning_horizon_minutes = n_slots * 30
+            planning_start = time_slots[0] if time_slots else datetime.now()
+            segments_by_vehicle = self._build_vehicle_charging_segments(
+                vehicles=vehicles,
+                energy_requirements=energy_requirements,
+                planning_start=planning_start,
+                planning_horizon_minutes=planning_horizon_minutes,
+            )
+            planning_horizon_minutes = n_slots * 30
+            planning_start = time_slots[0] if time_slots else datetime.now()
+            segments_by_vehicle = self._build_vehicle_charging_segments(
+                vehicles=vehicles,
+                energy_requirements=energy_requirements,
+                planning_start=planning_start,
+                planning_horizon_minutes=planning_horizon_minutes,
+            )
+            planning_horizon_minutes = n_slots * 30
+            planning_start = time_slots[0] if time_slots else datetime.now()
+            segments_by_vehicle = self._build_vehicle_charging_segments(
+                vehicles=vehicles,
+                energy_requirements=energy_requirements,
+                planning_start=planning_start,
+                planning_horizon_minutes=planning_horizon_minutes,
+            )
+
             logger.info(
                 f"[UNIFIED:INTEGRATED] Building model: "
-                f"{n_sequences} sequences, {n_routes} routes, "
+                f"{n_routes} routes, "
                 f"{n_vehicles} vehicles, {n_slots} slots"
             )
-            
+
             vehicle_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
-            
-            # ===== ALLOCATION VARIABLES =====
-            sequence_vars = [model.bool() for _ in range(n_sequences)]
-            
-            # Build mappings
-            route_coverage = {route_id: [] for route_id in route_ids}
-            vehicle_to_sequences = {}
-            
-            for seq_idx, (vehicle_id, route_sequence, cost) in enumerate(sequences):
-                vehicle_to_sequences.setdefault(vehicle_id, []).append(seq_idx)
-                for route in route_sequence:
-                    if route.route_id in route_coverage:
-                        route_coverage[route.route_id].append(seq_idx)
-            
-            # Allocation constraints
-            for vehicle_id, seq_indices in vehicle_to_sequences.items():
-                model.constraint(
-                    model.sum([sequence_vars[i] for i in seq_indices]) <= 1
-                )
-            
-            route_covered_vars = {}
-            for route_id in route_ids:
-                covering_sequences = route_coverage[route_id]
-                if covering_sequences:
-                    coverage_sum = model.sum([sequence_vars[idx] for idx in covering_sequences])
-                    model.constraint(coverage_sum <= 1)
-                    
-                    route_covered = model.bool()
-                    route_covered_vars[route_id] = route_covered
-                    model.constraint(route_covered <= coverage_sum)
-                    model.constraint(coverage_sum <= len(covering_sequences) * route_covered)
+
+            routes_by_vehicle, allocation_score_term = self._build_list_allocation_block(
+                model=model,
+                vehicles=vehicles,
+                routes=routes,
+                score_vr=score_vr,
+                feasible_vr=feasible_vr,
+                route_start_times=route_start_times,
+                route_end_times=route_end_times,
+                allocation_metadata=allocation_metadata,
+            )
             
             # ===== SCHEDULING VARIABLES =====
             # Calculate planning horizon in minutes
             planning_horizon_minutes = n_slots * 30
+            planning_start = time_slots[0] if time_slots else datetime.now()
+            segments_by_vehicle = self._build_vehicle_charging_segments(
+                vehicles=vehicles,
+                energy_requirements=energy_requirements,
+                planning_start=planning_start,
+                planning_horizon_minutes=planning_horizon_minutes,
+            )
             
             # Interval variables for charging sessions
             charging_sessions = []
@@ -783,14 +1045,22 @@ class UnifiedOptimizer:
             
             for v_idx, vehicle in enumerate(vehicles):
                 state = vehicle_states.get(vehicle.vehicle_id)
+                vehicle_segments = segments_by_vehicle.get(vehicle.vehicle_id, [(0, planning_horizon_minutes, "full_window")])
+                vehicle_sessions = []
+                vehicle_energies = []
+                vehicle_choices = []
+
                 if not state:
-                    # Create dummy variables for vehicles without state
-                    session = model.interval_var(0, planning_horizon_minutes)
-                    session.duration_min = 0
-                    session.duration_max = 0
-                    charging_sessions.append(session)
-                    energy_charged.append(model.float(0, 0))
-                    power_class_choice.append(model.int(0, 0))
+                    for seg_start, seg_end, _label in vehicle_segments:
+                        session = model.interval_var(seg_start, seg_end)
+                        session.duration_min = 0
+                        session.duration_max = 0
+                        vehicle_sessions.append(session)
+                        vehicle_energies.append(model.float(0, 0))
+                        vehicle_choices.append(model.int(0, 0))
+                    charging_sessions.append(vehicle_sessions)
+                    energy_charged.append(vehicle_energies)
+                    power_class_choice.append(vehicle_choices)
                     continue
                 
                 # Calculate energy bounds
@@ -803,29 +1073,28 @@ class UnifiedOptimizer:
                 else:
                     max_duration_minutes = 0
                 
-                # Create interval variable for charging session (optional)
-                session = model.interval_var(0, planning_horizon_minutes)
-                session.duration_min = 0  # Optional charging
-                session.duration_max = max_duration_minutes
-                charging_sessions.append(session)
-                
-                # Energy charged = charge_rate * (duration / 60)
-                energy = model.float(0, max_energy_needed)
-                if charge_rate_kw > 0:
-                    model.constraint(
-                        energy == (charge_rate_kw / 60.0) * model.length(session)
-                    )
-                else:
-                    model.constraint(energy == 0)
-                energy_charged.append(energy)
-                
-                # Power class choice (integer variable)
-                if site_chargers and self.config.enable_charger_allocation:
-                    n_charger_classes = len(site_chargers)
-                    choice = model.int(0, n_charger_classes - 1)
-                    power_class_choice.append(choice)
-                else:
-                    power_class_choice.append(model.int(0, 0))
+                for seg_start, seg_end, _label in vehicle_segments:
+                    session = model.interval_var(seg_start, seg_end)
+                    session.duration_min = 0
+                    session.duration_max = min(max_duration_minutes, max(0, seg_end - seg_start))
+                    vehicle_sessions.append(session)
+
+                    energy = model.float(0, max_energy_needed)
+                    if charge_rate_kw > 0:
+                        model.constraint(energy == (charge_rate_kw / 60.0) * model.length(session))
+                    else:
+                        model.constraint(energy == 0)
+                    vehicle_energies.append(energy)
+
+                    if site_chargers and self.config.enable_charger_allocation:
+                        n_charger_classes = len(site_chargers)
+                        vehicle_choices.append(model.int(0, n_charger_classes - 1))
+                    else:
+                        vehicle_choices.append(model.int(0, 0))
+
+                charging_sessions.append(vehicle_sessions)
+                energy_charged.append(vehicle_energies)
+                power_class_choice.append(vehicle_choices)
             
             if site_chargers and self.config.enable_charger_allocation:
                 n_charger_classes = len(site_chargers)
@@ -835,43 +1104,18 @@ class UnifiedOptimizer:
                 logger.info(f"[UNIFIED:INTEGRATED] Charger allocation DISABLED by config (site has {len(site_chargers)} power classes)")
             
             # ===== ROUTE EXECUTION INTERVALS =====
-            # Create interval variables for route execution in each sequence
-            route_intervals = {}  # vehicle_id -> list of route interval variables
-            planning_start = time_slots[0] if time_slots else datetime.now()
-            
-            for seq_idx, (vehicle_id, route_sequence, cost) in enumerate(sequences):
-                v_idx = vehicle_to_idx.get(vehicle_id)
-                if v_idx is None or not route_sequence:
-                    continue
-                
-                vehicle_routes = []
-                for route_idx, route in enumerate(route_sequence):
-                    # Calculate route timing in minutes from planning start
-                    route_start_time = (route.plan_start_date_time - planning_start).total_seconds() / 60.0
-                    route_duration = (route.plan_end_date_time - route.plan_start_date_time).total_seconds() / 60.0
-                    
-                    # Create interval variable for route execution
+            route_intervals: Dict[int, List] = {}
+            for v_idx, vehicle in enumerate(vehicles):
+                vehicle_route_intervals = []
+                route_list = routes_by_vehicle[v_idx]
+                for r_idx in range(n_routes):
                     route_iv = model.interval_var(0, planning_horizon_minutes)
-                    route_iv.duration_min = int(route_duration)
-                    route_iv.duration_max = int(route_duration)
-                    
-                    # Link route presence to sequence selection
-                    # If sequence selected, route must be present
-                    model.constraint(model.if_present(route_iv) == sequence_vars[seq_idx])
-                    
-                    # Route should start around its planned time (as a soft constraint via bounds)
-                    # For now, just ensure it's within the planning window
-                    
-                    vehicle_routes.append(route_iv)
-                
-                # Precedence constraints between consecutive routes
-                for i in range(len(vehicle_routes) - 1):
-                    # Route i+1 starts after route i ends (no turnaround time modeled here for simplicity)
-                    model.constraint(
-                        model.start(vehicle_routes[i + 1]) >= model.end(vehicle_routes[i])
-                    )
-                
-                route_intervals[vehicle_id] = vehicle_routes
+                    duration = int(route_durations[r_idx]) if len(route_durations) > r_idx else 0
+                    route_iv.duration_min = duration
+                    route_iv.duration_max = duration
+                    model.constraint(model.if_present(route_iv) == model.contains(route_list, r_idx))
+                    vehicle_route_intervals.append(route_iv)
+                route_intervals[vehicle.vehicle_id] = vehicle_route_intervals
             
             # ===== NO-OVERLAP CONSTRAINTS =====
             # Vehicle cannot charge and execute routes simultaneously
@@ -881,26 +1125,16 @@ class UnifiedOptimizer:
                 
                 # Add no-overlap between charging session and each route
                 for route_iv in route_intervals[vehicle.vehicle_id]:
-                    model.constraint(model.no_overlap(charging_sessions[v_idx], route_iv))
+                    for charge_iv in charging_sessions[v_idx]:
+                        model.constraint(model.no_overlap(charge_iv, route_iv))
             
             logger.info(f"[UNIFIED:INTEGRATED] Added route execution intervals and no-overlap constraints for {len(route_intervals)} vehicles")
             
             # ===== OBJECTIVE: WEIGHTED SUM =====
             
-            # Allocation term: route count + sequence scores
-            allocation_score_term = model.sum([
-                sequence_vars[i] * float(sequence_costs[i])
-                for i in range(n_sequences)
-            ])
-            
-            if route_covered_vars:
-                route_count_term = model.sum(list(route_covered_vars.values()))
-                allocation_term = (
-                    self.config.route_count_weight * route_count_term + 
-                    allocation_score_term
-                )
-            else:
-                allocation_term = allocation_score_term
+            # Allocation term: route count + score term
+            route_count_term = model.sum([model.count(lst) for lst in routes_by_vehicle])
+            allocation_term = self.config.route_count_weight * route_count_term + allocation_score_term
             
             # Scheduling term: charging cost
             # Calculate average price for simplicity
@@ -909,7 +1143,7 @@ class UnifiedOptimizer:
             cost_terms = []
             for v_idx in range(n_vehicles):
                 # Cost = average_price * energy_charged
-                cost = avg_price * energy_charged[v_idx]
+                cost = avg_price * (model.sum(energy_charged[v_idx]) if energy_charged[v_idx] else 0)
                 cost_terms.append(cost)
             
             # Shortfall penalty
@@ -924,9 +1158,8 @@ class UnifiedOptimizer:
                 
                 if max_shortfall > 0:
                     shortfall_v = model.float(0, max_shortfall)
-                    model.constraint(
-                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - energy_charged[v_idx]
-                    )
+                    total_vehicle_energy = model.sum(energy_charged[v_idx]) if energy_charged[v_idx] else 0
+                    model.constraint(shortfall_v >= target_soc_kwh - state.current_soc_kwh - total_vehicle_energy)
                     shortfall_terms.append(self.config.target_soc_shortfall_penalty * shortfall_v)
             
             scheduling_term = model.sum(cost_terms)
@@ -937,7 +1170,8 @@ class UnifiedOptimizer:
             if self.config.makespan_penalty_weight > 0:
                 makespan_terms = []
                 for v_idx in range(n_vehicles):
-                    makespan_terms.append(model.end(charging_sessions[v_idx]))
+                    for session in charging_sessions[v_idx]:
+                        makespan_terms.append(model.end(session))
                 if makespan_terms:
                     makespan = model.max(makespan_terms)
                     scheduling_term = scheduling_term + self.config.makespan_penalty_weight * makespan
@@ -955,7 +1189,7 @@ class UnifiedOptimizer:
                 model, vehicles, vehicle_states, energy_requirements,
                 availability_matrices, time_slots, forecast_data,
                 charging_sessions, energy_charged, vehicle_to_idx, site_chargers,
-                power_class_choice, planning_horizon_minutes
+                power_class_choice, planning_horizon_minutes, segments_by_vehicle
             )
             
             model.close()
@@ -964,19 +1198,23 @@ class UnifiedOptimizer:
             optimizer.param.time_limit = self.config.integrated_time_limit
             optimizer.solve()
             
-            # Extract allocation solution
-            selected_indices = [i for i in range(n_sequences) if sequence_vars[i].value == 1]
-            selected_sequences = [sequences[i] for i in selected_indices]
-            allocation_score = sum(sequences[i][2] for i in selected_indices)
-            routes_allocated = sum(
-                1 for r in route_covered_vars if route_covered_vars[r].value == 1
+            selected_sequences = self._extract_list_allocation_solution(
+                routes_by_vehicle=routes_by_vehicle,
+                vehicles=vehicles,
+                routes=routes,
+                score_vr=score_vr,
+                solution=optimizer.solution,
+            )
+            allocation_score = float(sum(seq[2] for seq in selected_sequences))
+            routes_allocated = int(
+                sum(len(route_sequence) for _, route_sequence, _ in selected_sequences)
             )
             
             # Extract scheduling solution
             vehicle_schedules, total_cost, total_energy = self._extract_interval_solution(
                 schedule_id, vehicles, vehicle_states, energy_requirements,
                 availability_matrices, time_slots, price_data, charging_sessions, energy_charged, vehicle_to_idx,
-                site_chargers, power_class_choice, planning_horizon_minutes, model
+                site_chargers, power_class_choice, planning_horizon_minutes, model, segments_by_vehicle
             )
             
             solve_time = optimizer.statistics.running_time
@@ -990,354 +1228,8 @@ class UnifiedOptimizer:
             )
             
             return UnifiedOptimizationResult(
-                mode=OptimizationMode.INTEGRATED,
-                status=status,
-                solve_time_seconds=solve_time,
-                selected_sequences=selected_sequences,
-                allocation_score=allocation_score,
-                routes_allocated=routes_allocated,
-                routes_total=n_routes,
-                vehicle_schedules=vehicle_schedules,
-                total_charging_cost=total_cost,
-                total_energy_kwh=total_energy,
-                objective_value=allocation_score - total_cost
-            )
-    
-    def _solve_scheduling_only_timeslot(
-        self,
-        schedule_id: int,
-        vehicles: List[Vehicle],
-        vehicle_states: Dict[int, VehicleChargeState],
-        energy_requirements: Dict[int, List[RouteEnergyRequirement]],
-        availability_matrices: Dict[int, VehicleAvailability],
-        time_slots: List[datetime],
-        forecast_data: Dict[datetime, float],
-        price_data: Dict[datetime, Tuple[float, bool]],
-        site_chargers: Optional[List[ChargerPowerClass]] = None,
-        fix_allocation: Optional[List[Tuple]] = None
-    ) -> UnifiedOptimizationResult:
-        """Solve scheduling-only optimization using time-slot variables (fallback)."""
-        with hx.HexalyOptimizer() as optimizer:
-            model = optimizer.model
-            
-            n_slots = len(time_slots)
-            n_vehicles = len(vehicles)
-            
-            logger.info(
-                f"[UNIFIED:SCHED:TIMESLOT] Building model: {n_vehicles} vehicles, {n_slots} slots"
-            )
-            
-            vehicle_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
-            
-            # Bounds helpers
-            def _max_charge_kw(v_idx: int) -> float:
-                state = vehicle_states.get(vehicles[v_idx].vehicle_id)
-                return state.ac_charge_rate_kw if state else 50.0
-            
-            def _max_cumulative_kwh(v_idx: int) -> float:
-                state = vehicle_states.get(vehicles[v_idx].vehicle_id)
-                if state:
-                    return max(0.0, state.battery_capacity_kwh - state.current_soc_kwh)
-                return 1000.0
-            
-            # Decision variables
-            charge_power = [
-                [model.float(0, _max_charge_kw(v_idx)) for v_idx in range(n_vehicles)]
-                for _ in range(n_slots)
-            ]
-            
-            cumulative_energy = [
-                [model.float(0, _max_cumulative_kwh(v_idx)) for v_idx in range(n_vehicles)]
-                for _ in range(n_slots)
-            ]
-            
-            # Charger allocation binary variables (if chargers provided and enabled)
-            charger_assigned = None
-            charger_power_to_idx = {}
-            n_charger_classes = 0
-            if site_chargers and self.config.enable_charger_allocation:
-                n_charger_classes = len(site_chargers)
-                charger_power_to_idx = {pc.max_power_kw: idx for idx, pc in enumerate(site_chargers)}
-                charger_assigned = [
-                    [model.bool() for _ in range(n_charger_classes)]
-                    for _ in range(n_vehicles)
-                ]
-                total_chargers = sum(pc.count for pc in site_chargers)
-                logger.info(f"[UNIFIED:SCHED:TIMESLOT] Added charger allocation vars: {n_vehicles} vehicles x {n_charger_classes} power classes ({total_chargers} chargers)")
-            elif site_chargers and not self.config.enable_charger_allocation:
-                logger.info(f"[UNIFIED:SCHED:TIMESLOT] Charger allocation DISABLED by config (site has {len(site_chargers)} power classes)")
-            
-            # Build objective: minimize charging cost + shortfall penalty
-            cost_terms = []
-            for t_idx, slot_time in enumerate(time_slots):
-                price, _ = price_data.get(slot_time, (0.15, False))
-                synthetic_price = self.config.synthetic_time_price_factor * (n_slots - t_idx) / n_slots
-                slot_cost = price + synthetic_price
-                
-                for v_idx in range(n_vehicles):
-                    energy_this_slot = charge_power[t_idx][v_idx] * 0.5
-                    cost_terms.append(slot_cost * energy_this_slot)
-            
-            # Shortfall penalty (soft target SOC)
-            shortfall_terms = []
-            for v_idx, vehicle in enumerate(vehicles):
-                state = vehicle_states.get(vehicle.vehicle_id)
-                if not state:
-                    continue
-                
-                target_soc_kwh = (self.config.target_soc_percent / 100.0) * state.battery_capacity_kwh
-                max_shortfall = max(0.0, target_soc_kwh - state.current_soc_kwh)
-                
-                if max_shortfall > 0:
-                    shortfall_v = model.float(0, max_shortfall)
-                    model.constraint(
-                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - cumulative_energy[n_slots - 1][v_idx]
-                    )
-                    shortfall_terms.append(self.config.target_soc_shortfall_penalty * shortfall_v)
-            
-            if shortfall_terms:
-                model.minimize(model.sum(cost_terms) + model.sum(shortfall_terms))
-            else:
-                model.minimize(model.sum(cost_terms))
-            
-            # Constraints
-            self._add_scheduling_constraints(
-                model, vehicles, vehicle_states, energy_requirements,
-                availability_matrices, time_slots, forecast_data,
-                charge_power, cumulative_energy, vehicle_to_idx, site_chargers,
-                charger_assigned, charger_power_to_idx
-            )
-            
-            model.close()
-            
-            # Solve
-            optimizer.param.time_limit = self.config.scheduling_time_limit
-            optimizer.solve()
-            
-            # Extract solution
-            solve_time = optimizer.statistics.running_time
-            status = str(optimizer.solution.status)
-            
-            vehicle_schedules, total_cost, total_energy = self._extract_scheduling_solution(
-                schedule_id, vehicles, vehicle_states, energy_requirements,
-                availability_matrices, time_slots, price_data, charge_power, cumulative_energy, vehicle_to_idx,
-                site_chargers, charger_assigned
-            )
-            
-            logger.info(
-                f"[UNIFIED:SCHED:TIMESLOT] Complete: {len(vehicle_schedules)} vehicles, "
-                f"cost={total_cost:.2f}, energy={total_energy:.2f} kWh"
-            )
-            
-            return UnifiedOptimizationResult(
-                mode=OptimizationMode.SCHEDULING_ONLY,
-                status=status,
-                solve_time_seconds=solve_time,
-                selected_sequences=fix_allocation or [],
-                vehicle_schedules=vehicle_schedules,
-                total_charging_cost=total_cost,
-                total_energy_kwh=total_energy,
-                objective_value=-total_cost  # Negative because we minimize cost
-            )
-    
-    def _solve_integrated_timeslot(
-        self,
-        sequences: List[Tuple],
-        route_ids: List[str],
-        sequence_costs: np.ndarray,
-        schedule_id: int,
-        vehicles: List[Vehicle],
-        vehicle_states: Dict[int, VehicleChargeState],
-        energy_requirements: Dict[int, List[RouteEnergyRequirement]],
-        availability_matrices: Dict[int, VehicleAvailability],
-        time_slots: List[datetime],
-        forecast_data: Dict[datetime, float],
-        price_data: Dict[datetime, Tuple[float, bool]],
-        site_chargers: Optional[List[ChargerPowerClass]] = None
-    ) -> UnifiedOptimizationResult:
-        """Solve integrated optimization using time-slot variables (fallback)."""
-        with hx.HexalyOptimizer() as optimizer:
-            model = optimizer.model
-            
-            n_sequences = len(sequences)
-            n_routes = len(route_ids)
-            n_slots = len(time_slots)
-            n_vehicles = len(vehicles)
-            
-            logger.info(
-                f"[UNIFIED:INTEGRATED:TIMESLOT] Building model: "
-                f"{n_sequences} sequences, {n_routes} routes, "
-                f"{n_vehicles} vehicles, {n_slots} slots"
-            )
-            
-            vehicle_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
-            
-            # ===== ALLOCATION VARIABLES =====
-            sequence_vars = [model.bool() for _ in range(n_sequences)]
-            
-            # Build mappings
-            route_coverage = {route_id: [] for route_id in route_ids}
-            vehicle_to_sequences = {}
-            
-            for seq_idx, (vehicle_id, route_sequence, cost) in enumerate(sequences):
-                vehicle_to_sequences.setdefault(vehicle_id, []).append(seq_idx)
-                for route in route_sequence:
-                    if route.route_id in route_coverage:
-                        route_coverage[route.route_id].append(seq_idx)
-            
-            # Allocation constraints
-            for vehicle_id, seq_indices in vehicle_to_sequences.items():
-                model.constraint(
-                    model.sum([sequence_vars[i] for i in seq_indices]) <= 1
-                )
-            
-            route_covered_vars = {}
-            for route_id in route_ids:
-                covering_sequences = route_coverage[route_id]
-                if covering_sequences:
-                    coverage_sum = model.sum([sequence_vars[idx] for idx in covering_sequences])
-                    model.constraint(coverage_sum <= 1)
-                    
-                    route_covered = model.bool()
-                    route_covered_vars[route_id] = route_covered
-                    model.constraint(route_covered <= coverage_sum)
-                    model.constraint(coverage_sum <= len(covering_sequences) * route_covered)
-            
-            # ===== SCHEDULING VARIABLES =====
-            def _max_charge_kw(v_idx: int) -> float:
-                state = vehicle_states.get(vehicles[v_idx].vehicle_id)
-                return state.ac_charge_rate_kw if state else 50.0
-            
-            def _max_cumulative_kwh(v_idx: int) -> float:
-                state = vehicle_states.get(vehicles[v_idx].vehicle_id)
-                if state:
-                    return max(0.0, state.battery_capacity_kwh - state.current_soc_kwh)
-                return 1000.0
-            
-            charge_power = [
-                [model.float(0, _max_charge_kw(v_idx)) for v_idx in range(n_vehicles)]
-                for _ in range(n_slots)
-            ]
-            
-            cumulative_energy = [
-                [model.float(0, _max_cumulative_kwh(v_idx)) for v_idx in range(n_vehicles)]
-                for _ in range(n_slots)
-            ]
-            
-            # Charger allocation binary variables (if chargers provided and enabled)
-            charger_assigned = None
-            charger_power_to_idx = {}
-            n_charger_classes = 0
-            if site_chargers and self.config.enable_charger_allocation:
-                n_charger_classes = len(site_chargers)
-                charger_power_to_idx = {pc.max_power_kw: idx for idx, pc in enumerate(site_chargers)}
-                charger_assigned = [
-                    [model.bool() for _ in range(n_charger_classes)]
-                    for _ in range(n_vehicles)
-                ]
-                total_chargers = sum(pc.count for pc in site_chargers)
-                logger.info(f"[UNIFIED:INTEGRATED:TIMESLOT] Added charger allocation vars: {n_vehicles} vehicles x {n_charger_classes} power classes ({total_chargers} chargers)")
-            elif site_chargers and not self.config.enable_charger_allocation:
-                logger.info(f"[UNIFIED:INTEGRATED:TIMESLOT] Charger allocation DISABLED by config (site has {len(site_chargers)} power classes)")
-            
-            # ===== OBJECTIVE: WEIGHTED SUM =====
-            
-            # Allocation term: route count + sequence scores
-            allocation_score_term = model.sum([
-                sequence_vars[i] * float(sequence_costs[i])
-                for i in range(n_sequences)
-            ])
-            
-            if route_covered_vars:
-                route_count_term = model.sum(list(route_covered_vars.values()))
-                allocation_term = (
-                    self.config.route_count_weight * route_count_term + 
-                    allocation_score_term
-                )
-            else:
-                allocation_term = allocation_score_term
-            
-            # Scheduling term: charging cost
-            cost_terms = []
-            for t_idx, slot_time in enumerate(time_slots):
-                price, _ = price_data.get(slot_time, (0.15, False))
-                synthetic_price = self.config.synthetic_time_price_factor * (n_slots - t_idx) / n_slots
-                slot_cost = price + synthetic_price
-                
-                for v_idx in range(n_vehicles):
-                    energy_this_slot = charge_power[t_idx][v_idx] * 0.5
-                    cost_terms.append(slot_cost * energy_this_slot)
-            
-            # Shortfall penalty
-            shortfall_terms = []
-            for v_idx, vehicle in enumerate(vehicles):
-                state = vehicle_states.get(vehicle.vehicle_id)
-                if not state:
-                    continue
-                
-                target_soc_kwh = (self.config.target_soc_percent / 100.0) * state.battery_capacity_kwh
-                max_shortfall = max(0.0, target_soc_kwh - state.current_soc_kwh)
-                
-                if max_shortfall > 0:
-                    shortfall_v = model.float(0, max_shortfall)
-                    model.constraint(
-                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - cumulative_energy[n_slots - 1][v_idx]
-                    )
-                    shortfall_terms.append(self.config.target_soc_shortfall_penalty * shortfall_v)
-            
-            scheduling_term = model.sum(cost_terms)
-            if shortfall_terms:
-                scheduling_term = scheduling_term + model.sum(shortfall_terms)
-            
-            # Combined weighted sum: maximize allocation - cost
-            # Note: We maximize, so subtract the cost term
-            combined_objective = (
-                self.config.allocation_score_weight * allocation_term -
-                self.config.scheduling_cost_weight * scheduling_term
-            )
-            model.maximize(combined_objective)
-            
-            # ===== SCHEDULING CONSTRAINTS =====
-            self._add_scheduling_constraints(
-                model, vehicles, vehicle_states, energy_requirements,
-                availability_matrices, time_slots, forecast_data,
-                charge_power, cumulative_energy, vehicle_to_idx, site_chargers,
-                charger_assigned, charger_power_to_idx
-            )
-            
-            model.close()
-            
-            # Solve
-            optimizer.param.time_limit = self.config.integrated_time_limit
-            optimizer.solve()
-            
-            # Extract allocation solution
-            selected_indices = [i for i in range(n_sequences) if sequence_vars[i].value == 1]
-            selected_sequences = [sequences[i] for i in selected_indices]
-            allocation_score = sum(sequences[i][2] for i in selected_indices)
-            routes_allocated = sum(
-                1 for r in route_covered_vars if route_covered_vars[r].value == 1
-            )
-            
-            # Extract scheduling solution
-            vehicle_schedules, total_cost, total_energy = self._extract_scheduling_solution(
-                schedule_id, vehicles, vehicle_states, energy_requirements,
-                availability_matrices, time_slots, price_data, charge_power, cumulative_energy, vehicle_to_idx,
-                site_chargers, charger_assigned
-            )
-            
-            solve_time = optimizer.statistics.running_time
-            status = str(optimizer.solution.status)
-            
-            logger.info(
-                f"[UNIFIED:INTEGRATED:TIMESLOT] Complete: "
-                f"{len(selected_sequences)} sequences, {routes_allocated}/{n_routes} routes, "
-                f"alloc_score={allocation_score:.2f}, "
-                f"charge_cost={total_cost:.2f}, energy={total_energy:.2f} kWh"
-            )
-            
-            return UnifiedOptimizationResult(
-                mode=OptimizationMode.INTEGRATED,
+                mode=[MODE_FLAG_ALLOCATION, MODE_FLAG_CHARGE_SCHEDULING]
+                + ([MODE_FLAG_CHARGER_ALLOCATION] if self.config.enable_charger_allocation else []),
                 status=status,
                 solve_time_seconds=solve_time,
                 selected_sequences=selected_sequences,
@@ -1364,7 +1256,8 @@ class UnifiedOptimizer:
         vehicle_to_idx: Dict[int, int],
         site_chargers: Optional[List[ChargerPowerClass]] = None,
         charger_assigned: Optional[List[List]] = None,
-        charger_power_to_idx: Optional[Dict[float, int]] = None
+        charger_power_to_idx: Optional[Dict[float, int]] = None,
+        segments_by_vehicle: Optional[Dict[int, List[Tuple[int, int, str]]]] = None,
     ):
         """Add scheduling constraints to model."""
         n_slots = len(time_slots)
@@ -1488,22 +1381,34 @@ class UnifiedOptimizer:
                 if state and state.charger_id is not None:
                     pc_idx = find_power_class_for_charger(state.charger_id)
                     if pc_idx is not None:
-                        # Force this vehicle to this power class
-                        model.constraint(charger_assigned[v_idx][pc_idx] == 1)
-                        # Ensure no other power class
-                        for other_pc_idx in range(n_charger_classes):
-                            if other_pc_idx != pc_idx:
-                                model.constraint(charger_assigned[v_idx][other_pc_idx] == 0)
+                        seg_assign = charger_assigned[v_idx]
+                        if seg_assign and isinstance(seg_assign[0], list):
+                            for s_idx in range(len(seg_assign)):
+                                model.constraint(seg_assign[s_idx][pc_idx] == 1)
+                                for other_pc_idx in range(n_charger_classes):
+                                    if other_pc_idx != pc_idx:
+                                        model.constraint(seg_assign[s_idx][other_pc_idx] == 0)
+                        else:
+                            model.constraint(seg_assign[pc_idx] == 1)
+                            for other_pc_idx in range(n_charger_classes):
+                                if other_pc_idx != pc_idx:
+                                    model.constraint(seg_assign[other_pc_idx] == 0)
                         logger.debug(f"[UNIFIED] Fixed vehicle {vehicle.vehicle_id} to power class {site_chargers[pc_idx].max_power_kw}kW")
                         fixed_vehicle_count += 1
             
             if fixed_vehicle_count > 0:
                 logger.info(f"[UNIFIED] Fixed {fixed_vehicle_count} vehicles to their currently connected charger power class")
             
-            # 8. One Power Class Per Vehicle
-            logger.info(f"[UNIFIED] Adding one-power-class-per-vehicle constraint: {n_vehicles} vehicles must each be assigned exactly 1 charger power class")
+            # 8. One Power Class Per Segment
+            logger.info("[UNIFIED] Adding one-power-class-per-segment continuity constraints")
             for v_idx in range(n_vehicles):
-                model.constraint(model.sum(charger_assigned[v_idx]) == 1)
+                seg_assign = charger_assigned[v_idx]
+                # nested [segment][class] in segment-aware mode, legacy [class] otherwise
+                if seg_assign and isinstance(seg_assign[0], list):
+                    for s_idx in range(len(seg_assign)):
+                        model.constraint(model.sum(seg_assign[s_idx]) == 1)
+                else:
+                    model.constraint(model.sum(seg_assign) == 1)
             
             # 9. Charger Capacity Constraint
             # Link charge_power[t][v] to assigned power class's max_power
@@ -1512,9 +1417,19 @@ class UnifiedOptimizer:
                     # Sum over all power classes: charge_power <= sum of (class_max * assigned_flag)
                     state = vehicle_states.get(vehicles[v_idx].vehicle_id)
                     vehicle_max_rate = state.ac_charge_rate_kw if state else 50.0
-                    
+                    seg_assign = charger_assigned[v_idx]
+                    if seg_assign and isinstance(seg_assign[0], list):
+                        slot_min = t_idx * 30
+                        segs = (segments_by_vehicle or {}).get(vehicles[v_idx].vehicle_id, [])
+                        seg_idx = self._segment_index_for_slot(segs, slot_min)
+                        if seg_idx is None:
+                            model.constraint(charge_power[t_idx][v_idx] == 0)
+                            continue
+                        class_flags = seg_assign[seg_idx]
+                    else:
+                        class_flags = seg_assign
                     max_power_sum = model.sum([
-                        min(vehicle_max_rate, site_chargers[pc_idx].max_power_kw) * charger_assigned[v_idx][pc_idx]
+                        min(vehicle_max_rate, site_chargers[pc_idx].max_power_kw) * class_flags[pc_idx]
                         for pc_idx in range(n_charger_classes)
                     ])
                     model.constraint(charge_power[t_idx][v_idx] <= max_power_sum)
@@ -1540,10 +1455,18 @@ class UnifiedOptimizer:
                         if has_nighttime:
                             # If charging during nighttime, must use last_nighttime power class
                             # This is enforced by fixing the power class assignment
-                            model.constraint(charger_assigned[v_idx][pc_idx] == 1)
-                            for other_pc_idx in range(n_charger_classes):
-                                if other_pc_idx != pc_idx:
-                                    model.constraint(charger_assigned[v_idx][other_pc_idx] == 0)
+                            seg_assign = charger_assigned[v_idx]
+                            if seg_assign and isinstance(seg_assign[0], list):
+                                for s_idx in range(len(seg_assign)):
+                                    model.constraint(seg_assign[s_idx][pc_idx] == 1)
+                                    for other_pc_idx in range(n_charger_classes):
+                                        if other_pc_idx != pc_idx:
+                                            model.constraint(seg_assign[s_idx][other_pc_idx] == 0)
+                            else:
+                                model.constraint(seg_assign[pc_idx] == 1)
+                                for other_pc_idx in range(n_charger_classes):
+                                    if other_pc_idx != pc_idx:
+                                        model.constraint(seg_assign[other_pc_idx] == 0)
                             logger.debug(f"[UNIFIED] Enforcing nighttime continuity: vehicle {vehicle.vehicle_id} must use {site_chargers[pc_idx].max_power_kw}kW power class")
                             nighttime_continuity_count += 1
             
@@ -1575,7 +1498,14 @@ class UnifiedOptimizer:
                         # If vehicle is available at this slot and assigned to this power class,
                         # it occupies a charger spot
                         if availability and availability.availability_matrix[t_idx]:
-                            vehicles_occupying_charger.append(charger_assigned[v_idx][pc_idx])
+                            seg_assign = charger_assigned[v_idx]
+                            if seg_assign and isinstance(seg_assign[0], list):
+                                segs = (segments_by_vehicle or {}).get(vehicle.vehicle_id, [])
+                                seg_idx = self._segment_index_for_slot(segs, t_idx * 30)
+                                if seg_idx is not None:
+                                    vehicles_occupying_charger.append(seg_assign[seg_idx][pc_idx])
+                            else:
+                                vehicles_occupying_charger.append(seg_assign[pc_idx])
                     
                     if vehicles_occupying_charger:
                         charger_count = site_chargers[pc_idx].count
@@ -1600,7 +1530,8 @@ class UnifiedOptimizer:
         vehicle_to_idx: Dict[int, int],
         site_chargers: Optional[List[ChargerPowerClass]] = None,
         power_class_choice: Optional[List] = None,
-        planning_horizon_minutes: int = 0
+        planning_horizon_minutes: int = 0,
+        segments_by_vehicle: Optional[Dict[int, List[Tuple[int, int, str]]]] = None,
     ):
         """Add interval-based scheduling constraints to model."""
         n_vehicles = len(vehicles)
@@ -1633,10 +1564,17 @@ class UnifiedOptimizer:
                 )
                 
                 if required_energy > 0:
-                    # Charging must finish before route starts
-                    model.constraint(model.end(charging_sessions[v_idx]) <= route_start_minutes)
-                    # Must charge enough energy
-                    model.constraint(energy_charged[v_idx] >= required_energy)
+                    relevant_energy_terms = []
+                    for seg_idx, session in enumerate(charging_sessions[v_idx]):
+                        relevant_energy_terms.append(
+                            model.iif(
+                                model.end(session) <= route_start_minutes,
+                                energy_charged[v_idx][seg_idx],
+                                0.0,
+                            )
+                        )
+                    if relevant_energy_terms:
+                        model.constraint(model.sum(relevant_energy_terms) >= required_energy)
         
         # 2. Maximum SOC (can't charge beyond battery capacity)
         # Already handled in energy_charged variable bounds
@@ -1653,22 +1591,15 @@ class UnifiedOptimizer:
             if not avail_matrix or len(avail_matrix) != len(time_slots):
                 continue
             
-            # Find first and last available slot
-            first_available = None
-            last_available = None
-            for t_idx, is_available in enumerate(avail_matrix):
-                if is_available:
-                    if first_available is None:
-                        first_available = t_idx
-                    last_available = t_idx
-            
+            # Charging sessions must stay in globally available bounds.
+            first_available = next((idx for idx, flag in enumerate(avail_matrix) if flag), None)
+            last_available = next((idx for idx in range(len(avail_matrix) - 1, -1, -1) if avail_matrix[idx]), None)
             if first_available is not None and last_available is not None:
-                # Charging session must fit within availability window
-                earliest_start = first_available * 30  # minutes
-                latest_end = (last_available + 1) * 30  # minutes
-                
-                model.constraint(model.start(charging_sessions[v_idx]) >= earliest_start)
-                model.constraint(model.end(charging_sessions[v_idx]) <= latest_end)
+                earliest_start = first_available * 30
+                latest_end = (last_available + 1) * 30
+                for session in charging_sessions[v_idx]:
+                    model.constraint(model.start(session) >= earliest_start)
+                    model.constraint(model.end(session) <= latest_end)
         
         # 4. Charger Power Class Constraints
         if site_chargers and power_class_choice and self.config.enable_charger_allocation:
@@ -1691,61 +1622,59 @@ class UnifiedOptimizer:
                         return pc_idx
                 return None
             
-            # 4a. Fixed Charger Power Class (Already Connected)
+            # 4a. Fixed Charger Power Class (Already Connected), pinned per segment.
             fixed_vehicle_count = 0
             for v_idx, vehicle in enumerate(vehicles):
                 state = vehicle_states.get(vehicle.vehicle_id)
                 if state and state.charger_id is not None:
                     pc_idx = find_power_class_for_charger(state.charger_id)
                     if pc_idx is not None:
-                        # Force this vehicle to this power class
-                        model.constraint(power_class_choice[v_idx] == pc_idx)
+                        for seg_choice in power_class_choice[v_idx]:
+                            model.constraint(seg_choice == pc_idx)
                         logger.debug(f"[UNIFIED] Fixed vehicle {vehicle.vehicle_id} to power class {site_chargers[pc_idx].max_power_kw}kW")
                         fixed_vehicle_count += 1
             
             if fixed_vehicle_count > 0:
                 logger.info(f"[UNIFIED] Fixed {fixed_vehicle_count} vehicles to their currently connected charger power class")
             
-            # 4b. Nighttime Charger Continuity Constraint
+            # 4b. Nighttime continuity pinning per nighttime-overlapping segment.
             nighttime_continuity_count = 0
             for v_idx, vehicle in enumerate(vehicles):
                 state = vehicle_states.get(vehicle.vehicle_id)
                 if state and state.last_nighttime_charger_id is not None and state.charger_id is None:
                     pc_idx = find_power_class_for_charger(state.last_nighttime_charger_id)
                     if pc_idx is not None:
-                        # Check if any nighttime slots exist in planning window
-                        has_nighttime = any((19 <= slot.hour) or (slot.hour < 7) for slot in time_slots)
-                        
-                        if has_nighttime:
-                            model.constraint(power_class_choice[v_idx] == pc_idx)
-                            logger.debug(f"[UNIFIED] Enforcing nighttime continuity: vehicle {vehicle.vehicle_id} must use {site_chargers[pc_idx].max_power_kw}kW power class")
-                            nighttime_continuity_count += 1
+                        segments = (segments_by_vehicle or {}).get(vehicle.vehicle_id, [])
+                        for seg_idx, (seg_start, seg_end, _label) in enumerate(segments):
+                            overlaps_night = False
+                            for slot in time_slots:
+                                minute = int((slot - planning_start).total_seconds() / 60.0)
+                                if seg_start <= minute < seg_end and ((19 <= slot.hour) or (slot.hour < 7)):
+                                    overlaps_night = True
+                                    break
+                            if overlaps_night:
+                                model.constraint(power_class_choice[v_idx][seg_idx] == pc_idx)
+                                nighttime_continuity_count += 1
             
             if nighttime_continuity_count > 0:
                 logger.info(f"[UNIFIED] Applied nighttime charger continuity constraint to {nighttime_continuity_count} vehicles")
             
-            # 4c. Charger Power Limit based on assigned power class
+            # 4c. Charger Power Limit based on assigned power class per segment.
             for v_idx, vehicle in enumerate(vehicles):
                 state = vehicle_states.get(vehicle.vehicle_id)
                 if not state:
                     continue
                 
                 vehicle_max_rate = state.ac_charge_rate_kw
-                
-                # Effective charge rate = min(vehicle_rate, charger_power[choice])
-                # We enforce this through the energy constraint
-                # energy_charged = (effective_rate / 60) * length(session)
-                # Since we already set energy = (vehicle_rate / 60) * length, we need to add:
-                # energy <= (charger_power[choice] / 60) * length
-                
-                for pc_idx in range(n_charger_classes):
-                    charger_power = site_chargers[pc_idx].max_power_kw
-                    effective_rate = min(vehicle_max_rate, charger_power)
-                    
-                    # If this power class is chosen, enforce the limit
-                    # This is tricky - we need conditional constraints
-                    # For now, we'll enforce it differently: adjust the energy constraint
-                    pass  # Will be enforced through energy limits
+                for seg_idx, session in enumerate(charging_sessions[v_idx]):
+                    max_power_expr = model.sum([
+                        min(vehicle_max_rate, site_chargers[pc_idx].max_power_kw) *
+                        model.iif(power_class_choice[v_idx][seg_idx] == pc_idx, 1, 0)
+                        for pc_idx in range(n_charger_classes)
+                    ])
+                    model.constraint(
+                        energy_charged[v_idx][seg_idx] <= (max_power_expr / 60.0) * model.length(session)
+                    )
             
             # 4d. Cumulative Charger Capacity Constraint using m.pulse()
             logger.info(f"[UNIFIED] Adding cumulative charger capacity constraints")
@@ -1753,16 +1682,10 @@ class UnifiedOptimizer:
                 usage_pulses = []
                 
                 for v_idx in range(n_vehicles):
-                    # Pulse is active when:
-                    # 1. Vehicle is charging (session present)
-                    # 2. Vehicle assigned to this power class
-                    
-                    # Create conditional pulse height: 1 if assigned to this class, 0 otherwise
-                    is_assigned_to_class = model.iif(power_class_choice[v_idx] == pc_idx, 1, 0)
-                    
-                    # Create pulse with conditional height
-                    pulse = model.pulse(charging_sessions[v_idx], is_assigned_to_class)
-                    usage_pulses.append(pulse)
+                    for seg_idx, session in enumerate(charging_sessions[v_idx]):
+                        is_assigned_to_class = model.iif(power_class_choice[v_idx][seg_idx] == pc_idx, 1, 0)
+                        pulse = model.pulse(session, is_assigned_to_class)
+                        usage_pulses.append(pulse)
                 
                 # Cumulative usage must not exceed charger count
                 if usage_pulses:
@@ -1786,7 +1709,8 @@ class UnifiedOptimizer:
         cumulative_energy: List[List],
         vehicle_to_idx: Dict[int, int],
         site_chargers: Optional[List[ChargerPowerClass]] = None,
-        charger_assigned: Optional[List[List]] = None
+        charger_assigned: Optional[List[List]] = None,
+        segments_by_vehicle: Optional[Dict[int, List[Tuple[int, int, str]]]] = None,
     ) -> Tuple[List[VehicleChargeSchedule], float, float]:
         """Extract scheduling solution from Hexaly variables."""
         vehicle_schedules = []
@@ -1850,30 +1774,67 @@ class UnifiedOptimizer:
             assigned_charger_power_kw = None
             
             if charger_assigned and site_chargers:
-                # Find assigned power class from decision variables
-                for pc_idx in range(len(site_chargers)):
-                    if charger_assigned[v_idx][pc_idx].value == 1:
-                        power_class = site_chargers[pc_idx]
-                        assigned_charger_power_kw = power_class.max_power_kw
-                        assigned_charger_type = 'DC' if power_class.is_dc else 'AC'
-                        
-                        # If vehicle has a connected charger, keep that ID, otherwise pick first from power class
-                        if assigned_charger_id is None and power_class.charger_ids:
-                            assigned_charger_id = power_class.charger_ids[0]
-                        
-                        # Track allocation for statistics
-                        charger_allocation_stats[pc_idx]['vehicles'].append({
-                            'vehicle_id': vehicle.vehicle_id,
-                            'charger_id': assigned_charger_id,
-                            'energy_scheduled': cumulative
-                        })
-                        
-                        logger.debug(
-                            f"[UNIFIED] Vehicle {vehicle.vehicle_id} assigned to {assigned_charger_power_kw}kW "
-                            f"({assigned_charger_type}) charger (ID: {assigned_charger_id}), "
-                            f"scheduled {cumulative:.2f} kWh"
-                        )
-                        break
+                seg_assign = charger_assigned[v_idx]
+                chosen_pc = None
+                if seg_assign and isinstance(seg_assign[0], list):
+                    # choose segment class corresponding to first charging slot, else first segment
+                    first_charging_slot_idx = None
+                    for t_idx in range(n_slots):
+                        if charge_power[t_idx][v_idx].value > 0.01:
+                            first_charging_slot_idx = t_idx
+                            break
+                    if first_charging_slot_idx is not None:
+                        segs = (segments_by_vehicle or {}).get(vehicle.vehicle_id, [])
+                        seg_idx = self._segment_index_for_slot(segs, first_charging_slot_idx * 30)
+                        if seg_idx is not None:
+                            for pc_idx in range(len(site_chargers)):
+                                if seg_assign[seg_idx][pc_idx].value == 1:
+                                    chosen_pc = pc_idx
+                                    break
+                    if chosen_pc is None and seg_assign:
+                        for pc_idx in range(len(site_chargers)):
+                            if seg_assign[0][pc_idx].value == 1:
+                                chosen_pc = pc_idx
+                                break
+                else:
+                    for pc_idx in range(len(site_chargers)):
+                        if seg_assign[pc_idx].value == 1:
+                            chosen_pc = pc_idx
+                            break
+
+                if chosen_pc is not None:
+                    pc_idx = chosen_pc
+                    power_class = site_chargers[pc_idx]
+                    assigned_charger_power_kw = power_class.max_power_kw
+                    assigned_charger_type = 'DC' if power_class.is_dc else 'AC'
+                    
+                    # If vehicle has a connected charger, keep that ID, otherwise pick first from power class
+                    if assigned_charger_id is None and power_class.charger_ids:
+                        assigned_charger_id = power_class.charger_ids[0]
+                    
+                    # Track allocation for statistics
+                    charger_allocation_stats[pc_idx]['vehicles'].append({
+                        'vehicle_id': vehicle.vehicle_id,
+                        'charger_id': assigned_charger_id,
+                        'energy_scheduled': cumulative
+                    })
+                    
+                    logger.debug(
+                        f"[UNIFIED] Vehicle {vehicle.vehicle_id} assigned to {assigned_charger_power_kw}kW "
+                        f"({assigned_charger_type}) charger (ID: {assigned_charger_id}), "
+                        f"scheduled {cumulative:.2f} kWh"
+                    )
+                # Segment continuity validation log
+                if seg_assign and isinstance(seg_assign[0], list):
+                    seg_trace = []
+                    for s_idx, seg_class_flags in enumerate(seg_assign):
+                        chosen = None
+                        for pc_idx in range(len(site_chargers)):
+                            if seg_class_flags[pc_idx].value == 1:
+                                chosen = pc_idx
+                                break
+                        seg_trace.append((s_idx, chosen))
+                    logger.info(f"[UNIFIED] Vehicle {vehicle.vehicle_id} segment class trace: {seg_trace}")
             
             vehicle_schedule = VehicleChargeSchedule(
                 vehicle_id=vehicle.vehicle_id,
@@ -1970,7 +1931,8 @@ class UnifiedOptimizer:
         site_chargers: Optional[List[ChargerPowerClass]] = None,
         power_class_choice: Optional[List] = None,
         planning_horizon_minutes: int = 0,
-        model = None
+        model = None,
+        segments_by_vehicle: Optional[Dict[int, List[Tuple[int, int, str]]]] = None,
     ) -> Tuple[List[VehicleChargeSchedule], float, float]:
         """Extract scheduling solution from interval variables."""
         from datetime import timedelta
@@ -2005,11 +1967,10 @@ class UnifiedOptimizer:
             else:
                 energy_needed = max(0.0, target_soc_kwh - state.current_soc_kwh)
             
-            # Extract interval solution values
-            session = charging_sessions[v_idx]
-            
-            # Get energy scheduled
-            energy_scheduled = energy_charged[v_idx].value
+            # Extract interval solution values across segments
+            vehicle_segment_sessions = charging_sessions[v_idx]
+            vehicle_segment_energy = energy_charged[v_idx]
+            energy_scheduled = sum(e.value for e in vehicle_segment_energy)
             
             # If no charging scheduled, create empty schedule
             if energy_scheduled < 0.01:
@@ -2029,84 +1990,72 @@ class UnifiedOptimizer:
                 vehicle_schedules.append(vehicle_schedule)
                 continue
             
-            # Get interval timing from solution values using model operators
-            if model:
-                start_minutes = model.start(session).value
-                end_minutes = model.end(session).value
-                duration_minutes = model.length(session).value
-            else:
-                # Fallback if model not provided
-                start_minutes = 0
-                end_minutes = int(energy_scheduled / state.ac_charge_rate_kw * 60) if state.ac_charge_rate_kw > 0 else 0
-                duration_minutes = end_minutes
-            
-            start_dt = planning_start + timedelta(minutes=start_minutes)
-            end_dt = planning_start + timedelta(minutes=end_minutes)
-            
-            # Determine assigned charger
+            # Determine assigned charger (primary segment, if any)
             assigned_charger_id = state.charger_id
             assigned_charger_type = state.charger_type
             assigned_charger_power_kw = None
             
-            if power_class_choice and site_chargers:
-                pc_idx = power_class_choice[v_idx].value
-                power_class = site_chargers[pc_idx]
-                assigned_charger_power_kw = power_class.max_power_kw
-                assigned_charger_type = 'DC' if power_class.is_dc else 'AC'
-                
-                # If not currently connected, assign first charger from power class
-                if assigned_charger_id is None and power_class.charger_ids:
-                    assigned_charger_id = power_class.charger_ids[0]
-                
-                # Track allocation for statistics
-                charger_allocation_stats[pc_idx]['vehicles'].append({
-                    'vehicle_id': vehicle.vehicle_id,
-                    'charger_id': assigned_charger_id,
-                    'energy_scheduled': energy_scheduled
-                })
-                
-                logger.debug(
-                    f"[UNIFIED] Vehicle {vehicle.vehicle_id} assigned to {assigned_charger_power_kw}kW "
-                    f"({assigned_charger_type}) charger (ID: {assigned_charger_id}), "
-                    f"scheduled {energy_scheduled:.2f} kWh from {start_dt} to {end_dt}"
-                )
-            
             # Create ChargeSlot entries for 30-min intervals (for backwards compatibility)
             charge_slots = []
             cumulative = 0.0
-            current_time = start_dt
-            
-            # Calculate constant power during charging
-            if duration_minutes > 0:
-                power_kw = (energy_scheduled / (duration_minutes / 60.0))
-            else:
-                power_kw = 0
-            
-            while current_time < end_dt:
-                next_time = current_time + timedelta(minutes=30)
-                if next_time > end_dt:
-                    next_time = end_dt
-                
-                slot_duration_hours = (next_time - current_time).total_seconds() / 3600.0
-                energy_this_slot = power_kw * slot_duration_hours
-                cumulative += energy_this_slot
-                
-                # Find price for this time slot
-                price, is_triad = price_data.get(current_time, (0.15, False))
-                
-                charge_slot = ChargeSlot(
-                    time_slot=current_time,
-                    charge_power_kw=power_kw,
-                    cumulative_energy_kwh=cumulative,
-                    electricity_price=price,
-                    is_triad_period=is_triad
+            segment_class_trace = []
+            for seg_idx, session in enumerate(vehicle_segment_sessions):
+                seg_energy = vehicle_segment_energy[seg_idx].value
+                if seg_energy < 0.01:
+                    continue
+                if model:
+                    start_minutes = model.start(session).value
+                    end_minutes = model.end(session).value
+                    duration_minutes = max(0.0, model.length(session).value)
+                else:
+                    start_minutes = 0
+                    end_minutes = int(seg_energy / state.ac_charge_rate_kw * 60) if state.ac_charge_rate_kw > 0 else 0
+                    duration_minutes = end_minutes
+
+                seg_start_dt = planning_start + timedelta(minutes=start_minutes)
+                seg_end_dt = planning_start + timedelta(minutes=end_minutes)
+                power_kw = (seg_energy / (duration_minutes / 60.0)) if duration_minutes > 0 else 0.0
+
+                if power_class_choice and site_chargers:
+                    pc_idx = int(power_class_choice[v_idx][seg_idx].value)
+                    power_class = site_chargers[pc_idx]
+                    assigned_charger_power_kw = power_class.max_power_kw
+                    assigned_charger_type = 'DC' if power_class.is_dc else 'AC'
+                    if assigned_charger_id is None and power_class.charger_ids:
+                        assigned_charger_id = power_class.charger_ids[0]
+                    charger_allocation_stats[pc_idx]['vehicles'].append({
+                        'vehicle_id': vehicle.vehicle_id,
+                        'charger_id': assigned_charger_id,
+                        'energy_scheduled': seg_energy
+                    })
+                    segment_class_trace.append((seg_idx, pc_idx, start_minutes, end_minutes))
+
+                current_time = seg_start_dt
+                while current_time < seg_end_dt:
+                    next_time = current_time + timedelta(minutes=30)
+                    if next_time > seg_end_dt:
+                        next_time = seg_end_dt
+
+                    slot_duration_hours = (next_time - current_time).total_seconds() / 3600.0
+                    energy_this_slot = power_kw * slot_duration_hours
+                    cumulative += energy_this_slot
+                    price, is_triad = price_data.get(current_time, (0.15, False))
+                    charge_slots.append(
+                        ChargeSlot(
+                            time_slot=current_time,
+                            charge_power_kw=power_kw,
+                            cumulative_energy_kwh=cumulative,
+                            electricity_price=price,
+                            is_triad_period=is_triad,
+                        )
+                    )
+                    total_cost += energy_this_slot * price
+                    current_time = next_time
+
+            if segment_class_trace:
+                logger.info(
+                    f"[UNIFIED] Vehicle {vehicle.vehicle_id} segment class trace: {segment_class_trace}"
                 )
-                charge_slots.append(charge_slot)
-                
-                # Calculate cost for this slot
-                total_cost += energy_this_slot * price
-                
-                current_time = next_time
             
             total_energy += energy_scheduled
             
@@ -2145,7 +2094,7 @@ class UnifiedOptimizer:
     
     def _greedy_fallback(
         self,
-        mode: OptimizationMode,
+        mode_flags: List[str],
         sequences: Optional[List[Tuple]],
         route_ids: Optional[List[str]],
         sequence_costs: Optional[np.ndarray],
@@ -2159,7 +2108,9 @@ class UnifiedOptimizer:
         fix_allocation: Optional[List[Tuple]]
     ) -> UnifiedOptimizationResult:
         """Greedy fallback when Hexaly unavailable."""
-        logger.warning(f"[UNIFIED] Using greedy fallback for mode: {mode.value}")
+        logger.warning(f"[UNIFIED] Using greedy fallback for mode flags: {mode_flags}")
+        run_allocation = MODE_FLAG_ALLOCATION in mode_flags
+        run_scheduling = MODE_FLAG_CHARGE_SCHEDULING in mode_flags
         
         # Allocation fallback
         selected_sequences = []
@@ -2167,7 +2118,7 @@ class UnifiedOptimizer:
         routes_allocated = 0
         routes_total = len(route_ids) if route_ids else 0
         
-        if mode in (OptimizationMode.ALLOCATION_ONLY, OptimizationMode.INTEGRATED):
+        if run_allocation:
             if sequences and route_ids and sequence_costs is not None:
                 sorted_indices = np.argsort(sequence_costs)[::-1]
                 covered_routes = set()
@@ -2201,7 +2152,7 @@ class UnifiedOptimizer:
         total_cost = 0.0
         total_energy = 0.0
         
-        if mode in (OptimizationMode.SCHEDULING_ONLY, OptimizationMode.INTEGRATED):
+        if run_scheduling:
             if vehicles and vehicle_states and time_slots and price_data:
                 for vehicle in vehicles:
                     state = vehicle_states.get(vehicle.vehicle_id)
@@ -2284,7 +2235,7 @@ class UnifiedOptimizer:
                     vehicle_schedules.append(vehicle_schedule)
         
         return UnifiedOptimizationResult(
-            mode=mode,
+            mode=mode_flags,
             status='greedy_fallback',
             solve_time_seconds=0.1,
             selected_sequences=selected_sequences,

@@ -19,9 +19,9 @@ from src.optimizer.unified_optimizer import (
     UnifiedOptimizer,
     UnifiedOptimizationConfig,
     UnifiedOptimizationResult,
-    OptimizationMode,
+    MODE_FLAG_ALLOCATION,
+    MODE_FLAG_CHARGE_SCHEDULING,
     normalize_mode_input,
-    resolve_optimization_from_modes,
 )
 from src.config import (
     APPLICATION_NAME, DEFAULT_ALLOCATION_WINDOW_HOURS,
@@ -82,18 +82,20 @@ class UnifiedController:
         # Floor to 30-minute interval for scheduling consistency
         current_time = self._floor_to_30_min(current_time)
         
-        # Parse mode flags -> OptimizationMode + charger allocation
-        opt_mode, enable_charger_allocation = self._parse_mode(mode)
+        # Parse mode flags -> normalized flags + charger allocation enablement
+        mode_flags, enable_charger_allocation = self._parse_mode(mode)
+        run_allocation = MODE_FLAG_ALLOCATION in mode_flags
+        run_scheduling = MODE_FLAG_CHARGE_SCHEDULING in mode_flags
         
         logger.info(
             f"Starting unified optimization for site {self.site_id}, "
-            f"mode_flags={normalize_mode_input(mode)}, solver_mode={opt_mode.value}, "
+            f"mode_flags={mode_flags}, "
             f"charger_allocation={enable_charger_allocation}"
         )
         
         try:
             # Phase 1: Initialization
-            self._initialize_optimization(current_time, opt_mode, window_hours_override=window_hours)
+            self._initialize_optimization(current_time, mode_flags, window_hours_override=window_hours)
             
             # Phase 2: Load configuration from MAF
             self._load_maf_configuration()
@@ -119,17 +121,18 @@ class UnifiedController:
             
             # Phase 5: Prepare optimization inputs based on mode
             opt_inputs = self._prepare_optimization_inputs(
-                opt_mode, vehicles, vehicle_states, window_start, window_end, current_time
+                mode_flags, vehicles, vehicle_states, window_start, window_end, current_time
             )
 
             # logger.info(f"Opt inputs: {opt_inputs}")
             
             # Phase 6: Run unified optimization
             if config is None:
-                config = self._build_optimization_config(opt_mode)
+                config = self._build_optimization_config(mode_flags)
             else:
-                config.mode = opt_mode
+                config.mode_flags = mode_flags
             config.enable_charger_allocation = enable_charger_allocation
+            opt_inputs["mode_flags"] = mode_flags
             
             optimizer = UnifiedOptimizer(config)
             unified_result = optimizer.solve(**opt_inputs)
@@ -142,7 +145,7 @@ class UnifiedController:
             allocation_result = None
             schedule_result = None
             
-            if opt_mode in (OptimizationMode.ALLOCATION_ONLY, OptimizationMode.INTEGRATED):
+            if run_allocation:
                 allocation_result = unified_result.to_allocation_result(
                     self.allocation_id, self.site_id, window_start, window_end,
                     opt_inputs.get('route_ids', [])
@@ -151,7 +154,7 @@ class UnifiedController:
                 allocation_result.routes_allocated = unified_result.routes_allocated
                 allocation_result.routes_in_window = unified_result.routes_total
             
-            if opt_mode in (OptimizationMode.SCHEDULING_ONLY, OptimizationMode.INTEGRATED):
+            if run_scheduling:
                 schedule_result = unified_result.to_schedule_result(
                     self.schedule_id, self.site_id, window_start, window_end
                 )
@@ -200,18 +203,19 @@ class UnifiedController:
     
     def _parse_mode(
         self, mode: Union[str, List[str], None]
-    ) -> Tuple[OptimizationMode, bool]:
+    ) -> Tuple[List[str], bool]:
         """
-        Parse mode input to OptimizationMode and enable_charger_allocation.
+        Parse mode input to normalized mode flags and enable_charger_allocation.
 
         mode may be a list of flags (allocation, charge_scheduling, charger_allocation)
         or a legacy single string.
         """
         mode_flags = normalize_mode_input(mode)
-        return resolve_optimization_from_modes(mode_flags)
+        enable_charger_allocation = "charger_allocation" in mode_flags
+        return mode_flags, enable_charger_allocation
     
     def _initialize_optimization(
-        self, current_time: datetime, mode: OptimizationMode,
+        self, current_time: datetime, mode_flags: List[str],
         window_hours_override: Optional[float] = None
     ):
         """Initialize allocation and/or scheduling monitor records."""
@@ -222,7 +226,7 @@ class UnifiedController:
         )
         
         # Create allocation monitor if needed
-        if mode in (OptimizationMode.ALLOCATION_ONLY, OptimizationMode.INTEGRATED):
+        if MODE_FLAG_ALLOCATION in mode_flags:
             result = db.execute_query(
                 Queries.CREATE_ALLOCATION_MONITOR,
                 (
@@ -239,7 +243,7 @@ class UnifiedController:
             logger.info(f"Created allocation monitor: allocation_id={self.allocation_id}")
         
         # Create or load scheduler config if needed
-        if mode in (OptimizationMode.SCHEDULING_ONLY, OptimizationMode.INTEGRATED):
+        if MODE_FLAG_CHARGE_SCHEDULING in mode_flags:
             if self.schedule_id:
                 # Load existing config
                 with db.get_cursor() as cur:
@@ -470,7 +474,7 @@ class UnifiedController:
     
     def _prepare_optimization_inputs(
         self,
-        mode: OptimizationMode,
+        mode_flags: List[str],
         vehicles: List[Vehicle],
         vehicle_states: Dict[int, VehicleChargeState],
         window_start: datetime,
@@ -481,7 +485,7 @@ class UnifiedController:
         opt_inputs = {}
         
         # Allocation inputs
-        if mode in (OptimizationMode.ALLOCATION_ONLY, OptimizationMode.INTEGRATED):
+        if MODE_FLAG_ALLOCATION in mode_flags:
             # Load routes
             routes = self._load_routes(window_start, window_end)
             logger.info(f"Loaded {len(routes)} routes for allocation")
@@ -510,16 +514,30 @@ class UnifiedController:
 
             logger.info(f"Builder: {builder}")
             
-            sequence_costs, sequences, metadata = builder.build_assignment_matrix()
+            (
+                score_vr,
+                feasible_vr,
+                route_start_times,
+                route_end_times,
+                route_durations,
+                route_energy_required,
+                metadata,
+            ) = builder.build_allocation_data()
             route_ids = [r.route_id for r in routes]
-            
-            opt_inputs['sequences'] = sequences
+
+            opt_inputs['allocation_routes'] = routes
+            opt_inputs['score_vr'] = score_vr
+            opt_inputs['feasible_vr'] = feasible_vr
+            opt_inputs['route_start_times'] = route_start_times
+            opt_inputs['route_end_times'] = route_end_times
+            opt_inputs['route_durations'] = route_durations
+            opt_inputs['route_energy_required'] = route_energy_required
+            opt_inputs['allocation_metadata'] = metadata
             opt_inputs['route_ids'] = route_ids
-            opt_inputs['sequence_costs'] = sequence_costs
         
-        logger.info(f"Mode: {mode}")
+        logger.info(f"Mode flags: {mode_flags}")
         # Scheduling inputs
-        if mode in (OptimizationMode.SCHEDULING_ONLY, OptimizationMode.INTEGRATED):
+        if MODE_FLAG_CHARGE_SCHEDULING in mode_flags:
             # Calculate fleet efficiency if not done
             if self.fleet_avg_efficiency == 0.35:
                 self._calculate_fleet_efficiency()
@@ -797,12 +815,12 @@ class UnifiedController:
         logger.info(f"Loaded {len(price_data)} price data points")
         return price_data
     
-    def _build_optimization_config(self, mode: OptimizationMode) -> UnifiedOptimizationConfig:
+    def _build_optimization_config(self, mode_flags: List[str]) -> UnifiedOptimizationConfig:
         """Build optimization configuration from MAF parameters."""
-        config = UnifiedOptimizationConfig(mode=mode)
+        config = UnifiedOptimizationConfig(mode_flags=mode_flags)
         
         # Load site capacity for scheduling
-        if mode in (OptimizationMode.SCHEDULING_ONLY, OptimizationMode.INTEGRATED):
+        if MODE_FLAG_CHARGE_SCHEDULING in mode_flags:
             with db.get_cursor() as cur:
                 cur.execute(
                     Queries.GET_SITE_ASC,

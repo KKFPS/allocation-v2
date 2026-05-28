@@ -36,7 +36,6 @@ from src.optimizer.unified_optimizer import (
     MODE_FLAG_CHARGER_ALLOCATION,
     UnifiedOptimizationConfig,
     normalize_mode_input,
-    resolve_optimization_from_modes,
 )
 
 print("Unified API loaded")
@@ -234,7 +233,6 @@ class UnifiedOptimizationRequest(BaseModel):
                 if flag not in seen:
                     seen.add(flag)
                     unique.append(flag)
-            resolve_optimization_from_modes([f.value for f in unique])
             return unique
         raise ValueError(
             "mode must be an array of flags: allocation, charge_scheduling, charger_allocation"
@@ -248,14 +246,14 @@ def _mode_flags_from_request(req: UnifiedOptimizationRequest) -> List[str]:
 def _build_config_from_request(req: UnifiedOptimizationRequest) -> UnifiedOptimizationConfig:
     """Build UnifiedOptimizationConfig from request mode flags and optional overrides."""
     mode_flags = _mode_flags_from_request(req)
-    opt_mode, enable_charger_from_mode = resolve_optimization_from_modes(mode_flags)
+    enable_charger_from_mode = MODE_FLAG_CHARGER_ALLOCATION in mode_flags
 
     if req.enable_charger_allocation is not None:
         enable_charger_allocation = req.enable_charger_allocation
     else:
         enable_charger_allocation = enable_charger_from_mode
 
-    defaults = UnifiedOptimizationConfig(mode=opt_mode)
+    defaults = UnifiedOptimizationConfig(mode_flags=mode_flags)
     has_overrides = any([
         req.allocation_time_limit is not None,
         req.scheduling_time_limit is not None,
@@ -273,12 +271,12 @@ def _build_config_from_request(req: UnifiedOptimizationRequest) -> UnifiedOptimi
 
     if not has_overrides and enable_charger_allocation == defaults.enable_charger_allocation:
         return UnifiedOptimizationConfig(
-            mode=opt_mode,
+            mode_flags=mode_flags,
             enable_charger_allocation=enable_charger_allocation,
         )
 
     return UnifiedOptimizationConfig(
-        mode=opt_mode,
+        mode_flags=mode_flags,
         allocation_time_limit=req.allocation_time_limit if req.allocation_time_limit is not None else defaults.allocation_time_limit,
         scheduling_time_limit=req.scheduling_time_limit if req.scheduling_time_limit is not None else defaults.scheduling_time_limit,
         integrated_time_limit=req.integrated_time_limit if req.integrated_time_limit is not None else defaults.integrated_time_limit,
@@ -302,7 +300,7 @@ def _result_to_jsonable(result: Any) -> Dict[str, Any]:
         return {"raw": str(result)}
 
     out = {
-        "mode": result.mode.value if hasattr(result.mode, "value") else str(result.mode),
+        "mode": result.mode if isinstance(result.mode, list) else (result.mode.value if hasattr(result.mode, "value") else str(result.mode)),
         "status": result.status,
         "solve_time_seconds": result.solve_time_seconds,
         "allocation_score": result.allocation_score,
