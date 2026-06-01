@@ -48,6 +48,37 @@ class VehicleScheduleReport:
 
 
 @dataclass
+class ChargeSlot:
+    """Single 30-minute charge slot assignment."""
+
+    time_slot: datetime
+    charge_power_kw: float = 0.0
+
+
+@dataclass
+class VehicleChargeSchedule:
+    """Per-vehicle charge schedule from optimization."""
+
+    vehicle_id: int
+    initial_soc_kwh: float = 0.0
+    charge_slots: List[ChargeSlot] = field(default_factory=list)
+    total_energy_scheduled_kwh: float = 0.0
+    assigned_charger_id: Optional[int] = None
+    assigned_charger_power_kw: Optional[float] = None
+
+
+@dataclass
+class ChargeScheduleResult:
+    """Charge scheduling result for persistence."""
+
+    schedule_id: int
+    site_id: int
+    planning_start: datetime
+    planning_end: datetime
+    vehicle_schedules: List[VehicleChargeSchedule] = field(default_factory=list)
+
+
+@dataclass
 class ScheduleReport:
     """Result of get_schedule_report(schedule_id, timestamp)."""
 

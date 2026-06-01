@@ -42,11 +42,11 @@ http://localhost:8000/optimize/unified
 
 {
 	"site_id": 513,
-	"mode": ["charge_scheduling", "charger_allocation"],
-	"allocation_score_weight": 2.0,
+	"mode": ["allocation", "charge_scheduling"],
+	"_comment_phase3": "add charger_allocation for variable power per charger/slot",
 	"test_start_time": "2026-03-21 00:00:00",
-	"scheduling_cost_weight": 0.5,
 	"window_hours": 24,
+	"p_fixed_kw": 50,
 	"persist_to_database": true,
 	"microlise_enabled": false,
 	"microlise_simulate": false

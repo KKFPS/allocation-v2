@@ -1,4 +1,4 @@
-"""Entry point for Phase 1 route allocation optimization."""
+"""Entry point for unified route allocation optimization."""
 import argparse
 from datetime import datetime
 
@@ -8,7 +8,7 @@ from src.utils.logging_config import logger
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 1 vehicle-route allocation optimizer",
+        description="Vehicle-route allocation optimizer",
     )
     parser.add_argument("--site-id", type=int, required=True, help="Site identifier")
     parser.add_argument(
@@ -47,32 +47,38 @@ def main():
     )
 
     try:
-        allocation_result, phase1_result = controller.run_unified_optimization(
+        allocation_result, _schedule_result, solver_result = controller.run_unified_optimization(
             current_time=start_time,
+            mode=["allocation"],
             persist_to_database=not args.no_persist,
             window_hours=args.window_hours,
         )
 
         print("\n" + "=" * 70)
-        print("PHASE 1 ALLOCATION COMPLETED")
+        print("ROUTE ALLOCATION COMPLETED")
         print("=" * 70)
         print(f"Site ID:          {args.site_id}")
-        print(f"Status:           {phase1_result.status}")
-        print(f"Objective:        {phase1_result.objective_value:.2f}")
-        print(f"Routes:           {phase1_result.routes_allocated}/{phase1_result.routes_total}")
-        print(f"Solve Time:       {phase1_result.solve_time_seconds:.2f}s")
+        if solver_result:
+            print(f"Status:           {solver_result.status}")
+            print(f"Objective:        {solver_result.objective_value:.2f}")
+            print(
+                f"Routes:           {solver_result.routes_allocated}/"
+                f"{solver_result.routes_total}"
+            )
+            print(f"Solve Time:       {solver_result.solve_time_seconds:.2f}s")
+        if allocation_result:
+            print(f"Total Score:      {allocation_result.total_score:.2f}")
         print(f"Allocation ID:    {controller.allocation_id}")
-        print(f"Total Score:      {allocation_result.total_score:.2f}")
         print("=" * 70)
 
         if not args.no_persist:
             print("\nResults persisted to database")
 
-        logger.info("Phase 1 allocation completed successfully")
+        logger.info("Route allocation completed successfully")
         return 0
 
     except Exception as e:
-        logger.error("Phase 1 allocation failed: %s", e, exc_info=True)
+        logger.error("Route allocation failed: %s", e, exc_info=True)
         print(f"\nError: {e}")
         return 1
     finally:

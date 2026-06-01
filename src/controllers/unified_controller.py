@@ -1,16 +1,24 @@
-"""Unified controller — Phase 1 route allocation only."""
+"""Unified controller — route allocation and charge scheduling."""
 
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from src.config import (
     APPLICATION_NAME,
     DEFAULT_ALLOCATION_WINDOW_HOURS,
     DEFAULT_MAX_ROUTES_PER_VEHICLE,
+    CHARGE_SLOT_MINUTES,
+    CHARGE_SLOTS_PER_CHARGER,
+    DEFAULT_P_FIXED_KW,
+    DEFAULT_ROUTE_ENERGY_SAFETY_MARGIN_KWH,
+    DEFAULT_TARGET_SOC_PERCENT,
     UNIFIED_ALLOCATION_TIME_LIMIT,
+    UNIFIED_INTEGRATED_TIME_LIMIT,
     UNIFIED_ROUTE_COUNT_WEIGHT,
+    UNIFIED_SCHEDULING_TIME_LIMIT,
 )
 from src.constraints.constraint_manager import ConstraintManager
+from src.constraints.energy_feasibility import EnergyFeasibilityConstraint
 from src.database.connection import db
 from src.database.queries import Queries
 from src.maf.parameter_parser import (
@@ -20,15 +28,36 @@ from src.maf.parameter_parser import (
 )
 from src.models.allocation import AllocationResult
 from src.models.route import Route
-from src.models.scheduler import ScheduleReport, VehicleScheduleReport
+from src.models.scheduler import (
+    ChargeScheduleResult,
+    ScheduleReport,
+    VehicleScheduleReport,
+)
 from src.models.vehicle import Vehicle
-from src.optimizer.cost_matrix import Phase1DataBuilder
-from src.optimizer.unified_optimizer import Phase1Config, Phase1Optimizer, Phase1Result
+from src.optimizer.allocation_optimizer import (
+    AllocationConfig,
+    RouteAllocationOptimizer,
+    RouteAllocationSolverResult,
+)
+from src.optimizer.cost_matrix import (
+    AllocationDataBuilder,
+    ChargeSchedulingContext,
+    ModelDataBuilder,
+)
+from src.optimizer.unified_optimizer import (
+    MODE_FLAG_ALLOCATION,
+    MODE_FLAG_CHARGE_SCHEDULING,
+    MODE_FLAG_CHARGER_ALLOCATION,
+    OptimizationConfig,
+    OptimizationResult,
+    UnifiedOptimizer,
+    normalize_mode,
+)
 from src.utils.logging_config import logger
 
 
 class UnifiedController:
-    """Orchestrates MAF config, data load, Phase 1 optimization, and persistence."""
+    """Orchestrates MAF config, optimization by mode, and persistence."""
 
     def __init__(
         self,
@@ -49,24 +78,42 @@ class UnifiedController:
     def run_unified_optimization(
         self,
         current_time: Optional[datetime] = None,
-        config: Optional[Phase1Config] = None,
+        mode: Optional[List[str]] = None,
+        config: Optional[OptimizationConfig] = None,
         persist_to_database: bool = True,
         window_hours: Optional[float] = None,
-    ) -> Tuple[AllocationResult, Phase1Result]:
+        p_fixed_kw: Optional[float] = None,
+    ) -> Tuple[
+        Optional[AllocationResult],
+        Optional[ChargeScheduleResult],
+        Optional[Union[RouteAllocationSolverResult, OptimizationResult]],
+    ]:
         """
-        Execute Phase 1 route allocation workflow.
+        Run optimization per mode flags.
 
         Returns:
-            Tuple of (AllocationResult, Phase1Result)
+            (allocation_result, schedule_result, solver_result)
         """
         if current_time is None:
             current_time = datetime.now()
         current_time = self._floor_to_30_min(current_time)
 
-        logger.info("Starting Phase 1 allocation for site %s", self.site_id)
+        mode_flags = normalize_mode(mode)
+        run_allocation = MODE_FLAG_ALLOCATION in mode_flags
+        run_scheduling = MODE_FLAG_CHARGE_SCHEDULING in mode_flags
+        enable_variable_power = MODE_FLAG_CHARGER_ALLOCATION in mode_flags
+        allocation_only = run_allocation and not run_scheduling
+
+        logger.info(
+            "Starting unified optimization site=%s mode=%s",
+            self.site_id,
+            mode_flags,
+        )
 
         try:
-            self._initialize_optimization(current_time, window_hours_override=window_hours)
+            self._initialize_optimization(
+                current_time, mode_flags, window_hours_override=window_hours
+            )
             self._load_maf_configuration()
 
             window_start, window_end, actual_hours = self._calculate_planning_window(
@@ -89,7 +136,7 @@ class UnifiedController:
             logger.info("Loaded %s vehicles after VOR filter", len(vehicles))
 
             routes = self._load_routes(window_start, window_end)
-            logger.info("Loaded %s routes for allocation", len(routes))
+            logger.info("Loaded %s routes", len(routes))
 
             constraint_configs = get_all_constraint_configs(self.site_id, self.site_config)
             self.constraint_manager = ConstraintManager(constraint_configs)
@@ -101,69 +148,221 @@ class UnifiedController:
             )
             vehicle_charger_map = self._load_vehicle_chargers(vehicles, current_time)
 
-            builder = Phase1DataBuilder(
-                vehicles=vehicles,
-                routes=routes,
-                constraint_manager=self.constraint_manager,
-                max_routes_per_vehicle=max_routes,
-                vehicle_charger_map=vehicle_charger_map,
-            )
-            model_data = builder.build()
+            allocation_result: Optional[AllocationResult] = None
+            schedule_result: Optional[ChargeScheduleResult] = None
+            solver_result: Optional[
+                Union[RouteAllocationSolverResult, OptimizationResult]
+            ] = None
 
-            if config is None:
-                config = Phase1Config(
-                    time_limit_seconds=UNIFIED_ALLOCATION_TIME_LIMIT,
+            if allocation_only:
+                builder = AllocationDataBuilder(
+                    vehicles=vehicles,
+                    routes=routes,
+                    constraint_manager=self.constraint_manager,
                     max_routes_per_vehicle=max_routes,
-                    route_count_weight=UNIFIED_ROUTE_COUNT_WEIGHT,
+                    vehicle_charger_map=vehicle_charger_map,
                 )
+                model_data = builder.build()
+                alloc_config = self._build_allocation_config(config, max_routes)
+                optimizer = RouteAllocationOptimizer(alloc_config)
+                solver_result = optimizer.solve(model_data)
+                allocation_result = solver_result.to_allocation_result(
+                    allocation_id=self.allocation_id,
+                    site_id=self.site_id,
+                    window_start=window_start,
+                    window_end=window_end,
+                    routes=model_data.routes,
+                    route_ids=model_data.route_ids,
+                    vehicles=model_data.vehicles,
+                    route_prizes=model_data.route_prizes,
+                )
+                allocation_result.total_score = solver_result.allocation_score
+                allocation_result.routes_allocated = solver_result.routes_allocated
+                allocation_result.routes_in_window = solver_result.routes_total
             else:
-                config.max_routes_per_vehicle = config.max_routes_per_vehicle or max_routes
-                if config.time_limit_seconds <= 0:
-                    config.time_limit_seconds = UNIFIED_ALLOCATION_TIME_LIMIT
+                time_slots = self._build_time_slots(window_start)
+                charge_horizon_end = self._charge_horizon_end(window_start)
+                n_chargers, charger_max_kw, charger_ids = self._load_site_chargers()
+                price_data = self._load_price_data(window_start, charge_horizon_end)
+                forecast_data = self._load_forecast_data(window_start, charge_horizon_end)
+                capacity_kw = self._build_capacity_per_slot(
+                    time_slots, forecast_data
+                )
+                electricity_cost = self._build_electricity_cost_per_slot(
+                    time_slots, price_data
+                )
+                p_fixed = p_fixed_kw or DEFAULT_P_FIXED_KW
 
-            optimizer = Phase1Optimizer(config)
-            phase1_result = optimizer.solve(model_data)
+                mandatory_nodes = {}
+                if run_scheduling and not run_allocation:
+                    mandatory_nodes = self._mandatory_nodes_from_allocations(
+                        vehicles, routes, window_start, window_end
+                    )
 
-            logger.info(
-                "Optimization completed: status=%s objective=%.2f time=%.2fs",
-                phase1_result.status,
-                phase1_result.objective_value,
-                phase1_result.solve_time_seconds,
-            )
+                builder = ModelDataBuilder(
+                    vehicles=vehicles,
+                    routes=routes,
+                    constraint_manager=self.constraint_manager,
+                    max_routes_per_vehicle=max_routes,
+                    vehicle_charger_map=vehicle_charger_map,
+                    mandatory_nodes=mandatory_nodes,
+                )
+                charge_ctx = ChargeSchedulingContext(
+                    n_chargers=n_chargers,
+                    time_slots=time_slots,
+                    electricity_cost_per_slot=electricity_cost,
+                    capacity_power_kw=capacity_kw,
+                    p_fixed_kw=p_fixed,
+                    charger_max_power_kw=charger_max_kw,
+                    enable_variable_charger_power=enable_variable_power,
+                )
+                model_data = builder.build(charge_context=charge_ctx)
+                model_data.charger_ids = charger_ids
 
-            allocation_result = phase1_result.to_allocation_result(
-                allocation_id=self.allocation_id,
-                site_id=self.site_id,
-                window_start=window_start,
-                window_end=window_end,
-                routes=model_data.routes,
-                route_ids=model_data.route_ids,
-                vehicles=model_data.vehicles,
-                route_prizes=model_data.route_prizes,
-            )
-            allocation_result.total_score = phase1_result.allocation_score
-            allocation_result.routes_allocated = phase1_result.routes_allocated
-            allocation_result.routes_in_window = phase1_result.routes_total
+                opt_config = self._build_integrated_config(
+                    config,
+                    max_routes,
+                    run_allocation,
+                    run_scheduling,
+                    p_fixed,
+                    enable_variable_power,
+                )
+                optimizer = UnifiedOptimizer(opt_config)
+                solver_result = optimizer.solve(model_data)
+
+                if run_allocation:
+                    allocation_result = solver_result.to_allocation_result(
+                        allocation_id=self.allocation_id,
+                        site_id=self.site_id,
+                        window_start=window_start,
+                        window_end=window_end,
+                        routes=model_data.routes,
+                        route_ids=model_data.route_ids,
+                        vehicles=model_data.vehicles,
+                        route_prizes=model_data.route_prizes,
+                    )
+                    allocation_result.total_score = solver_result.allocation_score
+                    allocation_result.routes_allocated = solver_result.routes_allocated
+                    allocation_result.routes_in_window = solver_result.routes_total
+
+                if run_scheduling:
+                    schedule_result = solver_result.to_schedule_result(
+                        schedule_id=self.schedule_id,
+                        site_id=self.site_id,
+                        planning_start=window_start,
+                        planning_end=charge_horizon_end,
+                        time_slots=time_slots,
+                        vehicles=vehicles,
+                        p_fixed_kw=p_fixed,
+                        charger_ids=getattr(model_data, "charger_ids", None),
+                    )
+
+            if solver_result:
+                logger.info(
+                    "Optimization completed: status=%s objective=%.2f time=%.2fs",
+                    solver_result.status,
+                    solver_result.objective_value,
+                    solver_result.solve_time_seconds,
+                )
 
             if persist_to_database:
-                if allocation_result.is_acceptable(min_score=-999999):
-                    self._persist_allocation(allocation_result)
-                    logger.info("Allocation results persisted")
-                else:
-                    logger.warning("Allocation result not acceptable, skipping persistence")
-                self._update_allocation_monitor(allocation_result)
+                if allocation_result:
+                    if allocation_result.is_acceptable(min_score=-999999):
+                        self._persist_allocation(allocation_result)
+                        logger.info("Allocation results persisted")
+                    else:
+                        logger.warning(
+                            "Allocation result not acceptable, skipping persistence"
+                        )
+                    self._update_allocation_monitor(allocation_result)
 
-            return allocation_result, phase1_result
+                if schedule_result and self.schedule_id:
+                    self._persist_schedule(schedule_result)
+                    self._update_scheduler_status("completed")
+
+            return allocation_result, schedule_result, solver_result
 
         except Exception as e:
-            logger.error("Phase 1 allocation failed: %s", e, exc_info=True)
+            logger.error("Unified optimization failed: %s", e, exc_info=True)
             if self.allocation_id:
                 db.execute_query(
                     Queries.UPDATE_ALLOCATION_MONITOR,
                     ("F", 0.0, 0, 0, 0, self.allocation_id),
                     fetch=False,
                 )
+            if self.schedule_id:
+                self._update_scheduler_status("failed")
             raise
+
+    def _build_allocation_config(
+        self, config: Optional[OptimizationConfig], max_routes: int
+    ) -> AllocationConfig:
+        if config is None:
+            return AllocationConfig(
+                time_limit_seconds=UNIFIED_ALLOCATION_TIME_LIMIT,
+                max_routes_per_vehicle=max_routes,
+                route_count_weight=UNIFIED_ROUTE_COUNT_WEIGHT,
+            )
+        return AllocationConfig(
+            time_limit_seconds=config.time_limit_seconds or UNIFIED_ALLOCATION_TIME_LIMIT,
+            max_routes_per_vehicle=config.max_routes_per_vehicle or max_routes,
+            route_count_weight=config.route_count_weight,
+            big_value_penalty=config.big_value_penalty,
+            verbosity=config.verbosity,
+        )
+
+    def _build_integrated_config(
+        self,
+        config: Optional[OptimizationConfig],
+        max_routes: int,
+        run_allocation: bool,
+        run_scheduling: bool,
+        p_fixed_kw: float,
+        enable_variable_charger_power: bool = False,
+    ) -> OptimizationConfig:
+        if run_allocation and run_scheduling:
+            time_limit = UNIFIED_INTEGRATED_TIME_LIMIT
+        elif run_scheduling:
+            time_limit = UNIFIED_SCHEDULING_TIME_LIMIT
+        else:
+            time_limit = UNIFIED_ALLOCATION_TIME_LIMIT
+
+        target_soc = float(
+            get_site_parameter(
+                self.site_config,
+                "target_soc_percent",
+                DEFAULT_TARGET_SOC_PERCENT,
+            )
+        )
+        safety_margin = DEFAULT_ROUTE_ENERGY_SAFETY_MARGIN_KWH
+        if self.constraint_manager:
+            for constraint in self.constraint_manager.get_enabled_constraints():
+                if isinstance(constraint, EnergyFeasibilityConstraint):
+                    safety_margin = float(
+                        constraint.params.get("safety_margin_kwh", safety_margin)
+                    )
+                    break
+
+        if config is None:
+            return OptimizationConfig(
+                time_limit_seconds=time_limit,
+                max_routes_per_vehicle=max_routes,
+                route_count_weight=UNIFIED_ROUTE_COUNT_WEIGHT,
+                p_fixed_kw=p_fixed_kw,
+                target_soc_percent=target_soc,
+                route_energy_safety_margin_kwh=safety_margin,
+                enable_variable_charger_power=enable_variable_charger_power,
+            )
+        if config.time_limit_seconds <= 0:
+            config.time_limit_seconds = time_limit
+        config.max_routes_per_vehicle = config.max_routes_per_vehicle or max_routes
+        config.p_fixed_kw = config.p_fixed_kw or p_fixed_kw
+        if config.target_soc_percent <= 0:
+            config.target_soc_percent = target_soc
+        if config.route_energy_safety_margin_kwh <= 0:
+            config.route_energy_safety_margin_kwh = safety_margin
+        config.enable_variable_charger_power = enable_variable_charger_power
+        return config
 
     def _floor_to_30_min(self, dt: datetime) -> datetime:
         minute = (dt.minute // 30) * 30
@@ -172,6 +371,7 @@ class UnifiedController:
     def _initialize_optimization(
         self,
         current_time: datetime,
+        mode_flags: List[str],
         window_hours_override: Optional[float] = None,
     ):
         window_hours = (
@@ -179,20 +379,210 @@ class UnifiedController:
             if window_hours_override is not None
             else DEFAULT_ALLOCATION_WINDOW_HOURS
         )
+
+        if MODE_FLAG_ALLOCATION in mode_flags:
+            result = db.execute_query(
+                Queries.CREATE_ALLOCATION_MONITOR,
+                (
+                    self.site_id,
+                    "N",
+                    self.trigger_type,
+                    current_time,
+                    current_time,
+                    current_time + timedelta(hours=window_hours),
+                ),
+                fetch=True,
+            )
+            self.allocation_id = result[0]["allocation_id"]
+            logger.info("Created allocation monitor: allocation_id=%s", self.allocation_id)
+
+        if MODE_FLAG_CHARGE_SCHEDULING in mode_flags:
+            self._initialize_scheduler()
+
+    def _initialize_scheduler(self):
+        if self.schedule_id:
+            rows = db.execute_query(
+                Queries.GET_SCHEDULER_CONFIG,
+                (self.schedule_id,),
+                fetch=True,
+            )
+            if not rows:
+                raise ValueError(f"Schedule ID {self.schedule_id} not found")
+            logger.info("Loaded scheduler config: schedule_id=%s", self.schedule_id)
+            return
+
         result = db.execute_query(
-            Queries.CREATE_ALLOCATION_MONITOR,
-            (
-                self.site_id,
-                "N",
-                self.trigger_type,
-                current_time,
-                current_time,
-                current_time + timedelta(hours=window_hours),
-            ),
+            Queries.CREATE_SCHEDULER,
+            (self.site_id, "dynamic", "running", True),
             fetch=True,
         )
-        self.allocation_id = result[0]["allocation_id"]
-        logger.info("Created allocation monitor: allocation_id=%s", self.allocation_id)
+        self.schedule_id = result[0]["schedule_id"]
+        logger.info("Created scheduler config: schedule_id=%s", self.schedule_id)
+
+    def _load_site_chargers(self) -> Tuple[int, List[float], List[int]]:
+        """Return (count, max_power_kw per charger index, charger_ids)."""
+        rows = db.execute_query(
+            Queries.GET_SITE_CHARGERS,
+            (self.site_id,),
+            fetch=True,
+        )
+        if not rows:
+            logger.info("Site %s: no chargers in DB, using 1 default", self.site_id)
+            return 1, [DEFAULT_P_FIXED_KW], [1]
+        powers = [float(r["max_power"] or DEFAULT_P_FIXED_KW) for r in rows]
+        ids = [int(r["charger_id"]) for r in rows]
+        logger.info(
+            "Site %s has %s active chargers (%.0f–%.0f kW)",
+            self.site_id,
+            len(rows),
+            min(powers),
+            max(powers),
+        )
+        return len(rows), powers, ids
+
+    def _build_time_slots(self, start: datetime) -> List[datetime]:
+        """Exactly 48 half-hour slots (24 h) per charger from floored start time."""
+        return [
+            start + timedelta(minutes=CHARGE_SLOT_MINUTES * i)
+            for i in range(CHARGE_SLOTS_PER_CHARGER)
+        ]
+
+    def _charge_horizon_end(self, start: datetime) -> datetime:
+        return start + timedelta(
+            minutes=CHARGE_SLOT_MINUTES * CHARGE_SLOTS_PER_CHARGER
+        )
+
+    def _load_forecast_data(
+        self, start: datetime, end: datetime
+    ) -> Dict[datetime, float]:
+        rows = db.execute_query(
+            Queries.GET_FORECAST_DATA,
+            (self.site_id, start, end),
+            fetch=True,
+        )
+        return {
+            row["forecasted_date_time"]: float(row["forecasted_consumption"])
+            for row in (rows or [])
+        }
+
+    def _load_price_data(
+        self, start: datetime, end: datetime
+    ) -> Dict[datetime, Tuple[float, bool]]:
+        rows = db.execute_query(
+            Queries.GET_PRICE_DATA,
+            (start, end),
+            fetch=True,
+        )
+        return {
+            row["date_time"]: (float(row["electricty_price_fixed"] or 0), bool(row["triad"]))
+            for row in (rows or [])
+        }
+
+    def _build_capacity_per_slot(
+        self, time_slots: List[datetime], forecast_data: Dict[datetime, float]
+    ) -> List[float]:
+        asc_rows = db.execute_query(Queries.GET_SITE_ASC, (self.site_id,), fetch=True)
+        site_kw = 500.0
+        if asc_rows and asc_rows[0].get("ASC"):
+            site_kw = float(asc_rows[0]["ASC"])
+        capacity = []
+        for slot in time_slots:
+            forecast_kw = forecast_data.get(slot, 0.0)
+            capacity.append(max(site_kw - forecast_kw, 0.0))
+        return capacity
+
+    def _build_electricity_cost_per_slot(
+        self,
+        time_slots: List[datetime],
+        price_data: Dict[datetime, Tuple[float, bool]],
+    ) -> List[float]:
+        """Negative prizes for charge nodes (minimize electricity cost)."""
+        costs = []
+        for slot in time_slots:
+            price, _triad = price_data.get(slot, (0.0, False))
+            costs.append(-float(price))
+        return costs
+
+    def _mandatory_nodes_from_allocations(
+        self,
+        vehicles: List[Vehicle],
+        routes: List[Route],
+        window_start: datetime,
+        window_end: datetime,
+    ) -> Dict[int, set]:
+        """Fix pre-allocated routes when running charge_scheduling only."""
+        route_id_to_idx = {r.route_id: idx for idx, r in enumerate(routes)}
+        mandatory: Dict[int, set] = {v_idx: set() for v_idx in range(len(vehicles))}
+        vehicle_id_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
+
+        for vehicle in vehicles:
+            rows = db.execute_query(
+                Queries.GET_ROUTES_FOR_SCHEDULING_ALLOCATED,
+                (vehicle.vehicle_id, window_start, window_end),
+                fetch=True,
+            )
+            v_idx = vehicle_id_to_idx.get(vehicle.vehicle_id)
+            if v_idx is None:
+                continue
+            for row in rows or []:
+                r_idx = route_id_to_idx.get(row["route_id"])
+                if r_idx is not None:
+                    mandatory[v_idx].add(r_idx)
+
+        return mandatory
+
+    def _persist_schedule(self, result: ChargeScheduleResult):
+        all_time_slots = self._build_time_slots(result.planning_start)
+        if len(all_time_slots) != CHARGE_SLOTS_PER_CHARGER:
+            raise ValueError(
+                f"Expected {CHARGE_SLOTS_PER_CHARGER} charge slots, got {len(all_time_slots)}"
+            )
+        db.execute_query(
+            Queries.DELETE_CHARGE_SCHEDULE_BY_SCHEDULE_ID,
+            (self.schedule_id,),
+            fetch=False,
+        )
+        total_inserted = 0
+        for vehicle_schedule in result.vehicle_schedules:
+            slot_power_map = {
+                slot.time_slot: slot.charge_power_kw
+                for slot in vehicle_schedule.charge_slots
+            }
+            connector_id = (
+                str(vehicle_schedule.assigned_charger_id)
+                if vehicle_schedule.assigned_charger_id is not None
+                else "1"
+            )
+            for slot_time in all_time_slots:
+                charge_power = slot_power_map.get(slot_time, 0.0)
+                db.execute_query(
+                    Queries.INSERT_CHARGE_SCHEDULE,
+                    (
+                        self.schedule_id,
+                        vehicle_schedule.vehicle_id,
+                        slot_time,
+                        charge_power,
+                        None,
+                        True,
+                        connector_id,
+                        datetime.now(),
+                        250,
+                        None,
+                        vehicle_schedule.assigned_charger_power_kw,
+                    ),
+                    fetch=False,
+                )
+                total_inserted += 1
+        logger.info("Persisted %s charge schedule rows", total_inserted)
+
+    def _update_scheduler_status(self, status: str):
+        if not self.schedule_id:
+            return
+        db.execute_query(
+            Queries.UPDATE_SCHEDULER_STATUS,
+            (status, self.schedule_id),
+            fetch=False,
+        )
 
     def _load_maf_configuration(self):
         logger.info("Loading MAF configuration for %s", APPLICATION_NAME)

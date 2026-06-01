@@ -52,7 +52,7 @@ DEFAULT_PLANNING_WINDOW_HOURS = 24.0
 DEFAULT_ROUTE_ENERGY_SAFETY_FACTOR = 1.15
 DEFAULT_MIN_DEPARTURE_BUFFER_MINUTES = 60
 DEFAULT_BACK_TO_BACK_THRESHOLD_MINUTES = 90
-DEFAULT_TARGET_SOC_PERCENT = 85.0
+DEFAULT_TARGET_SOC_PERCENT = 65.0
 # Minimum SOC (%) that vehicles must reach when charging (configurable in code)
 DEFAULT_MIN_SOC_PERCENT = 85.0
 DEFAULT_BATTERY_FACTOR = 1.0
@@ -110,10 +110,18 @@ UNIFIED_ALLOCATION_WEIGHT = 1.0      # α: weight for allocation term
 UNIFIED_SCHEDULING_WEIGHT = 1.0      # β: weight for scheduling cost term
 UNIFIED_ROUTE_COUNT_WEIGHT = 1e2     # Priority weight for route coverage
 PHASE1_TIE_BREAK_ROUTE_PRIZE = 0  # Per-route prize when constraint score is 0
-UNIFIED_SOC_SHORTFALL_PENALTY = 0.2  # Penalty per kWh shortfall from target
+# Soft penalty per kWh SOC shortfall (route energy / target SOC) in unified model
+UNIFIED_SOC_SHORTFALL_PENALTY = 15.0
+DEFAULT_ROUTE_ENERGY_SAFETY_MARGIN_KWH = 5.0
 
 # Unified optimizer time limits (seconds)
-UNIFIED_ALLOCATION_TIME_LIMIT = 60
+DEFAULT_P_FIXED_KW = 50.0
+
+# Charge scheduling grid: 30-minute slots, 48 per charger (24 h)
+CHARGE_SLOT_MINUTES = 30
+CHARGE_SLOTS_PER_CHARGER = 48
+
+UNIFIED_ALLOCATION_TIME_LIMIT = 30
 UNIFIED_SCHEDULING_TIME_LIMIT = 300
 UNIFIED_INTEGRATED_TIME_LIMIT = 330
 

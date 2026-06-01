@@ -1,4 +1,4 @@
-"""Unit tests for Phase 1 allocation optimizer."""
+"""Unit tests for route-only allocation optimizer."""
 
 from datetime import datetime, timedelta
 
@@ -8,8 +8,8 @@ import pytest
 from src.constraints.constraint_manager import ConstraintManager
 from src.models.route import Route
 from src.models.vehicle import Vehicle
-from src.optimizer.cost_matrix import Phase1DataBuilder
-from src.optimizer.unified_optimizer import Phase1Config, Phase1Optimizer
+from src.optimizer.allocation_optimizer import AllocationConfig, RouteAllocationOptimizer
+from src.optimizer.cost_matrix import AllocationDataBuilder
 
 
 def _make_route(route_id: str, start: datetime, hours: float = 2.0, mileage: float = 50.0) -> Route:
@@ -64,11 +64,11 @@ def minimal_problem():
     configs["turnaround_time_strict"]["enabled"] = True
     configs["turnaround_time_strict"]["params"] = {"minimum_minutes": 45}
     manager = ConstraintManager(configs)
-    builder = Phase1DataBuilder(vehicles, routes, manager, max_routes_per_vehicle=3)
+    builder = AllocationDataBuilder(vehicles, routes, manager, max_routes_per_vehicle=3)
     return builder.build()
 
 
-def test_phase1_data_builder_shapes(minimal_problem):
+def test_allocation_data_builder_shapes(minimal_problem):
     data = minimal_problem
     assert data.distance_matrix.shape == (3, 3)
     assert len(data.route_prizes) == 3
@@ -76,8 +76,8 @@ def test_phase1_data_builder_shapes(minimal_problem):
     assert np.all(data.route_prizes >= 0)
 
 
-def test_phase1_optimizer_greedy_or_hexaly(minimal_problem):
-    optimizer = Phase1Optimizer(Phase1Config(time_limit_seconds=5))
+def test_route_allocation_optimizer_greedy_or_hexaly(minimal_problem):
+    optimizer = RouteAllocationOptimizer(AllocationConfig(time_limit_seconds=5))
     result = optimizer.solve(minimal_problem)
     assert result.status in ("OPTIMAL", "FEASIBLE", "INFEASIBLE", "INCONSISTENT")
     assert result.routes_total == 3
