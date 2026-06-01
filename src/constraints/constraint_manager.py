@@ -4,7 +4,6 @@ from src.constraints.base import BaseConstraint
 from src.constraints.energy_feasibility import EnergyFeasibilityConstraint
 from src.constraints.turnaround_time import TurnaroundTimeStrictConstraint, TurnaroundTimePreferredConstraint
 from src.constraints.shift_hours import ShiftHoursStrictConstraint
-from src.constraints.charger_preference import ChargerPreferenceConstraint
 from src.models.vehicle import Vehicle
 from src.models.route import Route
 from src.utils.logging_config import logger
@@ -36,7 +35,6 @@ class ConstraintManager:
             'turnaround_time_strict': TurnaroundTimeStrictConstraint,
             'turnaround_time_preferred': TurnaroundTimePreferredConstraint,
             'shift_hours_strict': ShiftHoursStrictConstraint,
-            'charger_preference': ChargerPreferenceConstraint,
         }
         
         for name, constraint_class in constraint_classes.items():

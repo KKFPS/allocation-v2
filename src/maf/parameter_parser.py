@@ -170,14 +170,17 @@ def parse_maf_response(maf_json: Dict) -> Dict[int, Dict[str, Any]]:
                         # logger.info(f"Loaded MAF config for site {site_id}: {len(site_params)} parameters, {len(enabled_vehicles)} enabled vehicles")
                     except Exception as e:
                         logger.error(f"Failed to parse MAF config for site {site_id}: {e}")
+                        logger.error(traceback.format_exc())
                         continue
             except Exception as e:
                 logger.error(f"Failed to parse MAF config for client {client.get('client_id')}: {e}")
+                logger.error(traceback.format_exc())
                 continue
         return site_configs
         
     except Exception as e:
         logger.error(f"Failed to parse MAF response: {e}")
+        logger.error(traceback.format_exc())
         return {}
 
 
@@ -214,9 +217,8 @@ def get_all_constraint_configs(site_id: int, site_config: Dict) -> Dict[str, Dic
         'turnaround_time_preferred',
         'shift_hours_strict',
         'minimum_soonness',
-        'charger_preference',
         'swap_minimization',
-        'energy_optimization'
+        'energy_optimization',
     ]
     
     constraints = {}

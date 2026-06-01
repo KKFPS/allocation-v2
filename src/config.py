@@ -109,10 +109,11 @@ MICROLISE_BLOB_DIR = os.getenv("allocation_blob_dir", "")
 UNIFIED_ALLOCATION_WEIGHT = 1.0      # α: weight for allocation term
 UNIFIED_SCHEDULING_WEIGHT = 1.0      # β: weight for scheduling cost term
 UNIFIED_ROUTE_COUNT_WEIGHT = 1e2     # Priority weight for route coverage
+PHASE1_TIE_BREAK_ROUTE_PRIZE = 0  # Per-route prize when constraint score is 0
 UNIFIED_SOC_SHORTFALL_PENALTY = 0.2  # Penalty per kWh shortfall from target
 
 # Unified optimizer time limits (seconds)
-UNIFIED_ALLOCATION_TIME_LIMIT = 30
+UNIFIED_ALLOCATION_TIME_LIMIT = 60
 UNIFIED_SCHEDULING_TIME_LIMIT = 300
 UNIFIED_INTEGRATED_TIME_LIMIT = 330
 

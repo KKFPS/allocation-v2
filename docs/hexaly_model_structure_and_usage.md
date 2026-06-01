@@ -1,181 +1,204 @@
-# Hexaly Model: Structure, Flow, and Usage
+Here's the phased implementation spec:
 
-This document gives a high-level view of how the Hexaly-based optimization model is organized in this repository, how data flows through it, and how to run it safely.
+---
 
-## 1) What the model does
+# Phased Implementation Spec
 
-The unified optimizer supports three operating modes:
+## Shared Foundations (All Phases)
 
-- `allocation_only`: assign routes to vehicles.
-- `scheduling_only`: optimize charging for pre-determined route duties.
-- `integrated`: optimize allocation and charging together in one weighted objective.
-
-Primary implementation lives in:
-
-- `src/optimizer/unified_optimizer.py`
-- `src/optimizer/cost_matrix.py` (now a pairwise data preparer, not route-combination enumerator)
-- `src/controllers/unified_controller.py`
-
-## 2) High-level architecture
-
-```mermaid
-flowchart LR
-    UC[UnifiedController] --> DP[CostMatrixBuilder build_allocation_data]
-    UC --> SI[Scheduling input loaders]
-    DP --> UO[UnifiedOptimizer.solve]
-    SI --> UO
-    UO --> HM[Hexaly model]
-    HM --> RES[UnifiedOptimizationResult]
-    RES --> DB[Persistence and reports]
+### Node Pool
+```
+indices [0, nbRoutes)                          → route nodes
+indices [nbRoutes, nbRoutes + nbChargers*nbTimesteps)  → charge nodes (Phase 2+)
 ```
 
-### Core design
+### Core Sequence Structure
+```python
+vehicleSequence[v] <- list(nbNodes)
+constraint disjoint(vehicleSequence)
+```
 
-- Allocation uses **Hexaly native list variables** (`m.list`) instead of pre-generated route combinations.
-- Route assignment uses `m.partition(routes_by_vehicle)` so each route is assigned exactly once across vehicles (when routes exist).
-- ConstraintManager contributes pairwise feasibility/scores (`feasible_vr`, `score_vr`), while sequence-level constraints (turnaround, shift span) are enforced directly in Hexaly expressions.
+### Shared Data Arrays
+```python
+isCharge     = m.array([0]*nbRoutes + [1]*nbChargers*nbTimesteps)
+nodeReward   = m.array(routePrizes + chargePrizes)
+```
 
-## 3) Input data contract for list-based allocation
+---
 
-`CostMatrixBuilder.build_allocation_data()` prepares:
+## Phase 1: Route Allocation Only
 
-- `score_vr` (`n_vehicles x n_routes`): pair score for vehicle-route assignment.
-- `feasible_vr` (`n_vehicles x n_routes`): hard feasibility mask.
-- `route_start_times` (`n_routes`): route start (minutes).
-- `route_end_times` (`n_routes`): route end (minutes).
-- `route_durations` (`n_routes`): route duration (minutes).
-- `route_energy_required` (`n_vehicles x n_routes`): energy needed for each vehicle-route pair.
-- `metadata`: allocation parameters (e.g. strict turnaround, shift limit, preferred-turnaround penalties, max routes).
+### Nodes
+Only route nodes exist. `nbNodes = nbRoutes`.
 
-In the controller, these are passed directly to `UnifiedOptimizer.solve(...)`.
+### Sequence
+```python
+vehicleSequence[v] <- list(nbRoutes)
+constraint disjoint(vehicleSequence)
+```
 
-## 4) Model structure by mode
+### Forbidden / Mandatory
+```python
+for n in forbiddenNodesPerVehicle[v]:
+    constraint !contains(vehicleSequence[v], n)
 
-## Allocation-only
+for n in mandatoryNodesPerVehicle[v]:
+    constraint contains(vehicleSequence[v], n)
+```
 
-Decision layer:
+### Transition Feasibility
+Forbidden arcs encoded as large values in `distanceMatrix`. Infeasible route-to-route transitions (e.g. timing clash, wrong vehicle type) get `bigValue`:
 
-- `routes_by_vehicle = [m.list(n_routes) for vehicle in vehicles]`
-- `m.partition(routes_by_vehicle)` (if routes exist)
+```python
+routeDelay[v] <- sum(1...c, i => distanceMatrix[sequence[i-1]][sequence[i]])
+constraint routeDelay[v] < bigValuePenalty
+```
 
-Hard constraints:
+### SOC — Decreasing Only, Hard Floor at 0
+No charge nodes, SOC only decreases. Recursive array pattern from the model:
 
-- Per-vehicle route limit (`count(list) <= max_routes_per_vehicle`)
-- Infeasible assignments forbidden via `m.contains(list, route_idx) == 0`
-- Strict turnaround between consecutive list elements
-- Strict shift-hour duration cap on list span
+```python
+SOCAfterNode[v] <- array(0...count(sequence), (n, prev) =>
+    (n == 0 ? batteryStartSOC[v] : prev)
+    - electricityConsumption[v][sequence[n]]
+)
 
-Objective:
+outOfBattery[v] <- sum(0...c, n => max(0, -SOCAfterNode[v][n]))
+constraint outOfBattery[v] == 0
+```
 
-- `route_count_weight * total_assigned_routes + pair_score_sum + preferred_turnaround_soft_terms`
+### Objective
+```python
+maximize sum(v, sum(vehicleSequence[v], j => nodeReward[j]))
+```
 
-Output extraction:
+---
 
-- Read route index collections from solver solution and reconstruct `(vehicle_id, route_sequence, sequence_score)` tuples.
+## Phase 2: Route Allocation + Homogeneous Charge Scheduling
 
-## Scheduling-only
+### Additions over Phase 1
+- Charge nodes added to pool: `nbNodes = nbRoutes + nbChargers * nbTimesteps`
+- All charge nodes treated identically — fixed global charging power `P_fixed`
+- Electricity cost included in objective via `nodeTripPrize` (negative values for charge nodes)
+- Site capacity constraint active
 
-Uses interval-based scheduling model:
+### Node Pool
+```python
+isCharge  = m.array([0]*nbRoutes + [1]*(nbChargers*nbTimesteps))
+nodeReward = m.array(routePrizes + [electricityCostPerSlot]*nbChargers*nbTimesteps)
+```
 
-- charging interval variables
-- site capacity constraints
-- route energy requirement checkpoints
-- optional charger power-class allocation
+### Transition Feasibility
+`distanceMatrix` extended to cover charge nodes. All charger-to-charger transitions across different timesteps within same charger are allowed; cross-charger same-timestep transitions get `bigValue` (same arc-based approach as model comment):
 
-Objective minimizes charging cost + SOC shortfall penalties (and optional makespan term).
+```python
+# distanceMatrix[c0t0][c1t0] = bigValue   (same timestep, different charger)
+# distanceMatrix[c0t0][c0t1] = 0          (consecutive timestep, same charger)
+routeDelay[v] <- sum(1...c, i => distanceMatrix[sequence[i-1]][sequence[i]])
+constraint routeDelay[v] < bigValuePenalty
+```
 
-## Integrated
+### SOC — Bidirectional
+```python
+SOCAfterNode[v] <- array(0...count(sequence), (n, prev) =>
+    isCharge[sequence[n]] > 0
+    ? min((n==0 ? batteryStartSOC[v] : prev) + P_fixed, batteryMaxSOC[v])
+    : max((n==0 ? batteryStartSOC[v] : prev) - electricityConsumption[v][sequence[n]], 0)
+)
 
-Combines:
+outOfBattery[v] <- sum(0...c, n => max(0, -SOCAfterNode[v][n]))
+constraint outOfBattery[v] == 0
+```
 
-- list-based allocation block
-- interval-based scheduling block
-- optional route execution intervals linked to list membership (`if_present(route_interval) == contains(route_list, r_idx)`)
-- no-overlap between charging and route execution intervals
+### Site Capacity Constraint
+Since all chargers share the same power `P_fixed`, capacity is just a count of active charge nodes per timestep:
 
-Objective is weighted:
+```python
+constraint and[t in 0...nbTimesteps](
+    sum(v, sum(c in 0...nbChargers,
+        contains(vehicleSequence[v], nbRoutes + c*nbTimesteps + t)
+    )) * P_fixed < capacityPowerSite[t]
+)
+```
 
-- maximize `(allocation_term * allocation_score_weight) - (scheduling_term * scheduling_cost_weight)`
+### Objective
+```python
+maximize sum(v, sum(vehicleSequence[v], j => nodeReward[j]))
+# nodeReward for charge nodes is negative (electricity cost)
+# net objective = allocation reward - charging cost
+```
 
-## 5) Constraint ownership
+---
 
-### ConstraintManager-driven (pair scoring/feasibility)
+## Phase 3: Complete Model
 
-- Energy feasibility (hard, pair-level gate in `feasible_vr`)
-- Charger preference (soft contribution in `score_vr`)
-- Any other enabled constraints evaluated for single-route sequence
+### Additions over Phase 2
+- Per-charger max power: `chargerType[c]` defines upper bound
+- `chargingPowerUsed[c][t]` as decision variable `m.int(0, chargerType[c])`
+- Charger switching constraints via `distanceMatrix` forbidden arcs (already partially in Phase 2)
+- Site capacity uses actual power variables, not fixed power count
 
-### Hexaly-native sequencing constraints
+### Power Decision Variables
+```python
+chargingPowerUsed[c][t] <- int(0, chargerType[c])
+```
 
-- Strict turnaround between consecutive assigned routes
-- Preferred-turnaround soft penalties
-- Shift-hours upper bound across assigned list span
-- Partition and assignment cardinality constraints
+Power for a charge node `nbRoutes + c*nbTimesteps + t` is `chargingPowerUsed[c][t]`.
 
-This split keeps preprocessing lightweight while preserving sequence logic inside the solver.
+### SOC — Variable Power
+```python
+SOCAfterNode[v] <- array(0...count(sequence), (n, prev) =>
+    isCharge[sequence[n]] > 0
+    ? min((n==0 ? batteryStartSOC[v] : prev)
+          + chargingPowerUsed[chargerOf(sequence[n])][timestepOf(sequence[n])] * 0.5,
+          batteryMaxSOC[v])
+    : max((n==0 ? batteryStartSOC[v] : prev)
+          - electricityConsumption[v][sequence[n]], 0)
+)
+```
 
-## 6) Charger Continuity by Segment
+### Site Capacity — Variable Power
+```python
+constraint and[t in 0...nbTimesteps](
+    sum(v, sum(c in 0...nbChargers,
+        contains(vehicleSequence[v], nbRoutes + c*nbTimesteps + t)
+        * chargingPowerUsed[c][t]
+    )) < capacityPowerSite[t]
+)
+```
 
-When `charger_allocation` is enabled, charger assignment is modeled at **segment** granularity (power class level), not as a single whole-window assignment.
+### Charger Switching — Forbidden Arcs
+A vehicle cannot jump between two different chargers at the same timestep. Already enforced via `distanceMatrix` `bigValue` arcs. Additionally, between two route nodes, charger reassignment is free — enforced by allowing all `distanceMatrix[route][charger]` transitions.
 
-Per vehicle, segments are derived from route windows:
+```python
+# Forbidden: same timestep, different charger
+distanceMatrix[nbRoutes + c0*nbTimesteps + t][nbRoutes + c1*nbTimesteps + t] = bigValue  # c0 != c1
 
-- `pre_first`: optimization start to first route start
-- `between_i`: route `i` end to route `i+1` start
-- `post_last`: last route end to optimization end
+# Allowed: consecutive timestep, same charger
+distanceMatrix[nbRoutes + c*nbTimesteps + t][nbRoutes + c*nbTimesteps + (t+1)] = 0
 
-Rules:
+# Charger change allowed after route node — no restriction on distanceMatrix[route][any_charger]
+```
 
-- Power class is constant **within** each segment.
-- Power class may change **between** consecutive segments.
-- Continuity is enforced using segment intervals with segment class choice variables.
+### Objective
+```python
+maximize sum(v, sum(vehicleSequence[v], j => nodeReward[j]))
+# nodeReward[charge node c,t] = -electricityPrice[t] * chargingPowerUsed[c][t] * 0.5
+```
 
-Capacity semantics:
+---
 
-- At any time/slot, occupancy per power class must not exceed available charger count for that class.
-- Fixed current-connection and nighttime continuity pins are applied at segment level.
+## Phase Progression Summary
 
-## 7) Execution flow in code
-
-1. `UnifiedController.run_unified_optimization(...)` determines mode/config.
-2. `_prepare_optimization_inputs(...)` loads routes, vehicles, states, forecasts/prices.
-3. `CostMatrixBuilder.build_allocation_data()` builds pairwise allocation matrices.
-4. `UnifiedOptimizer.solve(...)` builds Hexaly model for selected mode.
-5. `model.close()` then `optimizer.solve()`.
-6. Results are extracted to `UnifiedOptimizationResult`, converted to legacy outputs, and persisted.
-
-## 8) Usage patterns
-
-### API usage (`/optimize/unified`)
-
-Use `mode` as a flag array:
-
-- `["allocation"]`
-- `["charge_scheduling"]`
-- `["allocation", "charge_scheduling", "charger_allocation"]` (integrated + charger allocation)
-
-### CLI usage
-
-`unified_main.py` supports multi-value mode flags and maps them to internal optimizer mode.
-
-## 9) Operational notes and guardrails
-
-- Requires Hexaly 14.0+ with interval variable support.
-- Greedy fallback still exists for Hexaly-disabled/error scenarios and uses legacy-compatible sequence tuples internally.
-- `route_energy_required` is prepared for future tighter integrated SOC-path coupling; current scheduling hard checks still rely on scheduling requirement inputs.
-
-## 10) Developer checklist for changes
-
-- Keep all model lookups in Hexaly expressions via `m.array(...)` + `m.at(...)`.
-- For list variables, prefer lambda-based aggregations (`m.sum(list_var, m.lambd(...))`) over Python loops for objective terms.
-- Extract list solutions via `optimizer.solution.get_collection_value(list_var)`.
-- Preserve compatibility with `UnifiedOptimizationResult.to_allocation_result(...)` tuple format.
-- Run compile/lint checks after modifying model expressions.
-
-## 11) Key files map
-
-- `src/optimizer/cost_matrix.py`: allocation data preparation (`build_allocation_data`)
-- `src/optimizer/unified_optimizer.py`: model build, solve, extraction
-- `src/controllers/unified_controller.py`: orchestration and input assembly
-- `docs/unified_optimizer_model.tex`: mathematical formulation (detailed)
-
+| Feature | Phase 1 | Phase 2 | Phase 3 |
+|---|---|---|---|
+| Route allocation | ✅ | ✅ | ✅ |
+| `disjoint(vehicleSequence)` | ✅ | ✅ | ✅ |
+| Forbidden/mandatory nodes | ✅ | ✅ | ✅ |
+| SOC tracking (decrease only) | ✅ | ✅ | ✅ |
+| Charge nodes in sequence | ❌ | ✅ | ✅ |
+| SOC increase on charge | ❌ | ✅ (fixed P) | ✅ (variable P) |
+| Electricity cost in objective | ❌ | ✅ | ✅ |
+| Site capacity constraint | ❌ | ✅ (count-based) | ✅ (power-based) |
+| Per-charger power variable | ❌ | ❌ | ✅ |
+| Charger switching constraints | ❌ | ❌ | ✅ |
