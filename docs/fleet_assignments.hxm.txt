@@ -1,0 +1,88 @@
+
+// We create Nodes which are either charging or route. We create 24h/0.5 = 48
+//  version of charging per battery.by granularity (here 30m)
+
+// We consider negative values for SOC for route and positive for charging
+// (same way as we model pick up and delivery problem)
+
+// We can write a constraint saying that the sum over the charging node
+// at each time step must be lower than the site capacity.
+
+/*
+2 charging point
+
+c0t0 c0t1 c0t2 c0t6   ...... c0t10 c0t11
+c1t0 c1t1 c1t2    ...... c1t10 c1t11
+
+// to model no charging points switching between two routes just put forbidden arcs for consecutive timestep with different charging point
+// Same idea if you have nights just add arcs to allows the switch 
+
+r1[7, 9]
+
+r1 -> c0t10
+r1 -> c1t10
+
+c0t0 -> c0t1
+c0t1 -> c0t2
+
+c1t0 -> c1t1
+c1t1 -> c1t2
+*/
+
+function model(){
+    // nb Nodes = nbRoutes + nbChargers * nbTimeStep.
+    vehicleSequence[v in 0...nbVehicles] <- list(nbNodes);
+    constraint disjoint(vehicleSequence);
+    routeOfNode[n in 0...nbNodes] <- find(vehicleSequence, n);
+
+    chargingPowerUsed [c in 0...nbChargers][nbtimestep] int(0, chargerType(c)); // keep it for a second version
+
+    for [v in 0...nbVehicles]{
+        local sequence <- vehicleSequence[v];
+        local c <- count(sequence);
+
+        distanceMatrix[n1][n2] = StartTask[n2] - endTasks[n1]
+
+        //distanceMatrix[charger1timestep0][charger3timestep0] = BigValue;
+        //route0[30, 120] route1[90, 160]
+        //distanceMatrix[route0][route1] = BigValue;
+
+        // Distance traveled by vehicle v (distance here is used for time and forbidden transition, we do endTimes-startTimes and a big value for forbidden arcs)
+        routeDelay[v] <- sum(1...c, i => distanceMatrix[sequence[i - 1]][sequence[i]]);
+
+        constraint routeDelay[v] < bigValuePenality; // no forbidden arcs should be taken
+
+        // Trips done by vehicle v
+        // can be set to 0 for charging nodes or see if we want the price to be computed in the same value
+        //if it's a route you put the reward for the route (positive value)
+        //if you want to model the eletricity cost (negative value)
+        vehiculeSequenceTotalReward[v] <- sum(sequence, j => nodeTripPrize[j]);
+
+        // Forbidding some routes or chargers (for example you said vans for only small routes ?)
+        for [n in forbiddenNodesPerVehicle[v]] constraint !contains(sequence, n);
+
+        // Mandatory (If any ?)
+        for [n in MandatoryNodesPerVehicle[v]] constraint contains(sequence, n);
+
+        // Evolution from one node to the next like in PDP
+        // If positive it's a charger and the SOC goes up
+        SOCAfterNode[v] <- array(0...count(sequence), (n, prev) => isCharge[sequence[n]] > 0 ?
+                // Charger
+                min((n == 0 ? vehiclesData[vehicles[v]].batteryStartSOC : prev) // Better to start with chargingItensity as a fixed value
+                        + chargingPower[chargerTypes[sequence[n]]], vehiclesData[vehicles[v]].batteryMaxSOC)
+                // Route
+                : min(n == 0 ? vehiclesData[vehicles[v]].batteryStartSOC : prev)
+                        - electricityConsumption[vehiclesData[vehicles[v]]][routeCost[sequence[n]]], vehiclesData[vehicles[v]].batteryMinSOC); // Depends on vehicule and route ?
+
+        // with electricityCosnumption beeing a matrix [nbVehicules][nbRoutes]
+
+
+        // Out of bounds 
+        outOfBatteryBounds[v] <- sum(0...c, n => max(0, vehiclesData[vehicles[v]].batteryMinTargetKWh - chargeAfterNode[v][n]));   
+    }
+    
+    // To ensure that capacity of the chargers at every timestep is under the total site capacity
+    constraint and[t in 0...nbTimesteps]
+        (sum(0...nbVehicles, v => sum(0...nbChargers, c => contains(sequence[v], nbRoute + c * nbTimesteps + t) * chargingPower[c][t])) < capacityPowerSite[t]);
+
+}

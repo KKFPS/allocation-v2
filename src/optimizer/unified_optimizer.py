@@ -22,14 +22,21 @@ from src.models.allocation import AllocationResult, RouteAllocation
 from src.models.route import Route
 from src.models.scheduler import ChargeScheduleResult, ChargeSlot, VehicleChargeSchedule
 from src.models.vehicle import Vehicle
-from src.optimizer.allocation_optimizer import route_transition_delay
+from src.optimizer.allocation_optimizer import (
+    route_transition_delay,
+    sequence_service_time,
+)
 from src.optimizer.cost_matrix import (
     BIG_VALUE,
     OptimizationModelData,
     apply_incompatible_route_pair_constraints,
     charge_node_index,
 )
-from src.optimizer.optimizer_debug import log_model_inputs, validate_optimization_result
+from src.optimizer.optimizer_debug import (
+    log_model_inputs,
+    validate_optimization_result,
+    write_optimizer_debug_csv,
+)
 from src.utils.logging_config import logger
 
 MODE_FLAG_ALLOCATION = "allocation"
@@ -233,9 +240,26 @@ class UnifiedOptimizer:
 
         if not IS_HEXALY_ACTIVE:
             logger.warning("Hexaly not active — using greedy fallback")
-            return self._greedy_fallback(model_data)
+            result = self._greedy_fallback(model_data)
+            self._write_debug_csv(model_data, result)
+            return result
 
         return self._solve_hexaly(model_data)
+
+    def _write_debug_csv(
+        self,
+        model_data: OptimizationModelData,
+        result: OptimizationResult,
+        model_stats: Optional[Dict] = None,
+        validation_warnings: Optional[List[str]] = None,
+    ) -> None:
+        write_optimizer_debug_csv(
+            model_data,
+            config=self.config,
+            result=result,
+            model_stats=model_stats,
+            validation_warnings=validation_warnings,
+        )
 
     def _solve_hexaly(self, model_data: OptimizationModelData) -> OptimizationResult:
         start_time = time.time()
@@ -270,6 +294,7 @@ class UnifiedOptimizer:
             energy_arr = m.array(model_data.energy_consumption.tolist())
             battery_start = m.array(model_data.battery_start_soc.tolist())
             battery_max = m.array(model_data.battery_max_soc.tolist())
+            duration_arr = m.array(model_data.node_durations.tolist())
 
             vehicle_sequences = [m.list(n_nodes) for _ in range(n_vehicles)]
             m.constraint(m.disjoint(vehicle_sequences))
@@ -357,8 +382,10 @@ class UnifiedOptimizer:
 
             for seq in vehicle_sequences:
                 delay = route_transition_delay(m, seq, dist_arr)
+                service = sequence_service_time(m, seq, duration_arr)
+                total_shift = delay + service
                 m.constraint(delay < self.config.big_value_penalty)
-                m.constraint(delay <= shift_max)
+                m.constraint(total_shift <= shift_max)
 
             if max_routes < n_routes:
                 for route_count_v in route_count_terms:
@@ -402,7 +429,7 @@ class UnifiedOptimizer:
                         m.lambda_function(
                             lambda n, prev: m.iif(
                                 m.at(is_charge_arr, seq[n]) > 0,
-                                m.min(prev + p_fixed, max_kwh),
+                                m.min(prev + p_fixed * slot_hours, max_kwh),
                                 m.max(
                                     prev - m.at(energy_arr, v_idx, seq[n]), 0
                                 ),
@@ -410,11 +437,6 @@ class UnifiedOptimizer:
                         ),
                         start_kwh,
                     )
-                soc_before = m.array(
-                    m.range(0, m.count(seq)),
-                    m.lambda_function(lambda n, prev: prev),
-                    start_kwh,
-                )
                 out_of_battery = m.sum(
                     m.range(0, m.count(seq)),
                     m.lambda_function(lambda n: m.max(0, -m.at(soc_after, n))),
@@ -441,7 +463,11 @@ class UnifiedOptimizer:
                                     m.at(energy_arr, v_idx, seq[n]) + safety_margin,
                                     target_kwh,
                                 )
-                                - m.at(soc_before, n),
+                                - m.iif(
+                                    n == 0,
+                                    start_kwh,
+                                    m.at(soc_after, n - 1),
+                                ),
                             ),
                         )
                     ),
@@ -521,11 +547,20 @@ class UnifiedOptimizer:
                 )
             m.maximize(objective)
 
+            model_stats = {
+                "nb_expressions": m.get_nb_expressions(),
+                "nb_decisions": m.get_nb_decisions(),
+                "nb_constraints": m.get_nb_constraints(),
+                "n_vehicle_sequences": n_vehicles,
+                "n_charge_power_vars": (
+                    n_chargers * n_timesteps if variable_power else 0
+                ),
+            }
             logger.info(
                 "Unified model built: vehicles=%s nodes=%s expressions=%s",
                 n_vehicles,
                 n_nodes,
-                m.get_nb_expressions(),
+                model_stats["nb_expressions"],
             )
             m.close()
             optimizer.param.time_limit = self.config.time_limit_seconds
@@ -579,8 +614,11 @@ class UnifiedOptimizer:
                 routes_total=n_routes,
                 allocation_score=obj_value,
             )
-            validate_optimization_result(
+            warnings = validate_optimization_result(
                 model_data, result, self.config.route_count_weight
+            )
+            self._write_debug_csv(
+                model_data, result, model_stats=model_stats, validation_warnings=warnings
             )
             return result
 

@@ -125,3 +125,8 @@ UNIFIED_ALLOCATION_TIME_LIMIT = 30
 UNIFIED_SCHEDULING_TIME_LIMIT = 300
 UNIFIED_INTEGRATED_TIME_LIMIT = 330
 
+# Path for optimizer debug CSV export; set to empty string to disable
+UNIFIED_OPTIMIZER_DEBUG_CSV = os.getenv(
+    "UNIFIED_OPTIMIZER_DEBUG_CSV", "unified_optimizer_debug.csv"
+)
+

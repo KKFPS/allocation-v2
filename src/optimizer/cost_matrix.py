@@ -69,6 +69,7 @@ class AllocationModelData:
     battery_start_soc: np.ndarray
     battery_max_soc: np.ndarray
     energy_consumption: np.ndarray
+    node_durations: np.ndarray
     metadata: Dict
     incompatible_route_pairs: List[Tuple[int, int]] = field(default_factory=list)
 
@@ -125,6 +126,7 @@ class OptimizationModelData:
     n_chargers: int = 0
     n_timesteps: int = 0
     is_charge: np.ndarray = field(default_factory=lambda: np.array([]))
+    node_durations: np.ndarray = field(default_factory=lambda: np.array([]))
     node_rewards: np.ndarray = field(default_factory=lambda: np.array([]))
     p_fixed_kw: float = 0.0
     capacity_power_kw: List[float] = field(default_factory=list)
@@ -234,6 +236,7 @@ class AllocationDataBuilder:
         forbidden_nodes = self._build_forbidden_nodes(feasible_vr)
         mandatory_nodes = self._build_mandatory_nodes()
         battery_start_soc, battery_max_soc = self._build_battery_arrays()
+        route_durations = route_end_times - route_start_times
 
         metadata = {
             "vehicles": n_vehicles,
@@ -284,6 +287,7 @@ class AllocationDataBuilder:
             battery_start_soc=battery_start_soc,
             battery_max_soc=battery_max_soc,
             energy_consumption=energy_consumption,
+            node_durations=route_durations,
             metadata=metadata,
             incompatible_route_pairs=incompatible_pairs,
         )
@@ -417,6 +421,7 @@ class ModelDataBuilder(AllocationDataBuilder):
             n_chargers=0,
             n_timesteps=0,
             is_charge=np.zeros(n_routes, dtype=int),
+            node_durations=allocation.node_durations.copy(),
             node_rewards=allocation.route_prizes.copy(),
             p_fixed_kw=0.0,
             capacity_power_kw=[],
@@ -463,10 +468,15 @@ class ModelDataBuilder(AllocationDataBuilder):
         dist[:n_routes, :n_routes] = rr
 
         for r_idx in range(n_routes):
+            route_end = route_end_times[r_idx]
             for c in range(n_chargers):
                 for t in range(n_timesteps):
                     cn = charge_node_index(n_routes, n_timesteps, c, t)
-                    dist[r_idx, cn] = 0.0
+                    gap = float(slot_start_times[t] - route_end)
+                    if gap < 0:
+                        dist[r_idx, cn] = BIG_VALUE
+                    else:
+                        dist[r_idx, cn] = 0.0
 
         for c in range(n_chargers):
             for t in range(n_timesteps):
@@ -506,6 +516,13 @@ class ModelDataBuilder(AllocationDataBuilder):
                     else:
                         dist[cn, r_idx] = gap
 
+        route_durations = route_end_times - route_start_times
+        node_durations = np.concatenate(
+            [
+                route_durations,
+                np.full(n_chargers * n_timesteps, slot_duration, dtype=float),
+            ]
+        )
         is_charge = np.array([0] * n_routes + [1] * (n_chargers * n_timesteps), dtype=int)
         price_per_slot = [
             abs(float(ctx.electricity_cost_per_slot[t]))
@@ -553,6 +570,7 @@ class ModelDataBuilder(AllocationDataBuilder):
             n_chargers=n_chargers,
             n_timesteps=n_timesteps,
             is_charge=is_charge,
+            node_durations=node_durations,
             node_rewards=node_rewards,
             p_fixed_kw=ctx.p_fixed_kw,
             capacity_power_kw=list(ctx.capacity_power_kw),

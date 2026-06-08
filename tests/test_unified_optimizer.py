@@ -84,6 +84,8 @@ def test_model_data_builder_shapes(minimal_problem):
     assert data.distance_matrix.shape == (3, 3)
     assert len(data.route_prizes) == 3
     assert data.energy_consumption.shape == (2, 3)
+    assert len(data.node_durations) == 3
+    assert data.node_durations[0] == pytest.approx(120.0)
     assert np.all(data.route_prizes >= 0)
     assert not data.enable_charge_scheduling
 
@@ -128,6 +130,82 @@ def test_integrated_model_data_builder_shapes(minimal_problem):
     assert data.n_nodes == n_nodes
     assert data.distance_matrix.shape == (n_nodes, n_nodes)
     assert data.enable_charge_scheduling
+
+
+def test_route_to_charge_forbids_slot_before_route_end(minimal_problem):
+    """Charge slot starting before route end must be infeasible (BIG_VALUE arc)."""
+    base = datetime(2026, 6, 1, 6, 0, 0)
+    slots = _forty_eight_slots(base)
+    ctx = ChargeSchedulingContext(
+        n_chargers=1,
+        time_slots=slots,
+        electricity_cost_per_slot=[-1.0] * CHARGE_SLOTS_PER_CHARGER,
+        capacity_power_kw=[500.0] * CHARGE_SLOTS_PER_CHARGER,
+        p_fixed_kw=50.0,
+    )
+    routes = minimal_problem.routes
+    vehicles = minimal_problem.vehicles
+    manager = ConstraintManager(
+        {
+            name: {"enabled": False, "params": {}, "penalty": 0}
+            for name in [
+                "energy_feasibility",
+                "turnaround_time_strict",
+                "turnaround_time_preferred",
+                "shift_hours_strict",
+                "minimum_soonness",
+                "swap_minimization",
+                "energy_optimization",
+            ]
+        }
+    )
+    builder = ModelDataBuilder(vehicles, routes, manager, max_routes_per_vehicle=3)
+    data = builder.build(charge_context=ctx)
+    n_routes = len(routes)
+    n_timesteps = len(slots)
+    route0_end = routes[0].plan_end_date_time
+    early_slot = next(
+        i
+        for i, t in enumerate(slots)
+        if t < route0_end
+    )
+    cn_early = charge_node_index(n_routes, n_timesteps, 0, early_slot)
+    assert data.distance_matrix[0, cn_early] >= BIG_VALUE
+
+
+def test_integrated_node_durations_include_charge_slots(minimal_problem):
+    base = datetime(2026, 6, 1, 6, 0, 0)
+    slots = _forty_eight_slots(base)
+    ctx = ChargeSchedulingContext(
+        n_chargers=2,
+        time_slots=slots,
+        electricity_cost_per_slot=[-1.0] * CHARGE_SLOTS_PER_CHARGER,
+        capacity_power_kw=[500.0] * CHARGE_SLOTS_PER_CHARGER,
+        p_fixed_kw=50.0,
+    )
+    vehicles = minimal_problem.vehicles
+    routes = minimal_problem.routes
+    manager = ConstraintManager(
+        {
+            name: {"enabled": False, "params": {}, "penalty": 0}
+            for name in [
+                "energy_feasibility",
+                "turnaround_time_strict",
+                "turnaround_time_preferred",
+                "shift_hours_strict",
+                "minimum_soonness",
+                "swap_minimization",
+                "energy_optimization",
+            ]
+        }
+    )
+    builder = ModelDataBuilder(vehicles, routes, manager, max_routes_per_vehicle=3)
+    data = builder.build(charge_context=ctx)
+    assert len(data.node_durations) == data.n_nodes
+    assert data.node_durations[0] == pytest.approx(120.0)
+    assert np.all(
+        data.node_durations[data.n_routes :] == float(CHARGE_SLOT_MINUTES)
+    )
 
 
 def test_charge_node_index_and_cross_charger_arcs(minimal_problem):

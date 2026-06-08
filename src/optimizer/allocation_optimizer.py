@@ -26,8 +26,10 @@ from src.optimizer.cost_matrix import (
     apply_incompatible_route_pair_constraints,
 )
 from src.optimizer.optimizer_debug import (
+    allocation_model_to_optimization_data,
     log_allocation_model_inputs,
     validate_allocation_solver_result,
+    write_optimizer_debug_csv,
 )
 from src.utils.logging_config import logger
 
@@ -43,6 +45,14 @@ def route_transition_delay(m, seq, dist_arr):
     return m.sum(
         m.range(1, m.count(seq)),
         m.lambda_function(lambda i: m.at(dist_arr, seq[i - 1], seq[i])),
+    )
+
+
+def sequence_service_time(m, seq, duration_arr):
+    """Sum per-node service durations (route length, charge slot length) in minutes."""
+    return m.sum(
+        m.range(0, m.count(seq)),
+        m.lambda_function(lambda i: m.at(duration_arr, seq[i])),
     )
 
 
@@ -196,6 +206,7 @@ class RouteAllocationOptimizer:
             energy_arr = m.array(model_data.energy_consumption.tolist())
             battery_start = m.array(model_data.battery_start_soc.tolist())
             battery_max = m.array(model_data.battery_max_soc.tolist())
+            duration_arr = m.array(model_data.node_durations.tolist())
 
             vehicle_sequences = [m.list(n_routes) for _ in range(n_vehicles)]
             m.constraint(m.disjoint(vehicle_sequences))
@@ -219,10 +230,12 @@ class RouteAllocationOptimizer:
 
             for seq in vehicle_sequences:
                 delay = route_transition_delay(m, seq, dist_arr)
+                service = sequence_service_time(m, seq, duration_arr)
+                total_shift = delay + service
                 m.constraint(delay < self.config.big_value_penalty)
                 if max_routes < n_routes:
                     m.constraint(m.count(seq) <= max_routes)
-                m.constraint(delay <= shift_max)
+                m.constraint(total_shift <= shift_max)
 
             for v_idx, seq in enumerate(vehicle_sequences):
                 start_kwh = m.at(battery_start, v_idx)
@@ -262,6 +275,12 @@ class RouteAllocationOptimizer:
             objective = w * route_count_term + prize_term
             m.maximize(objective)
 
+            model_stats = {
+                "nb_expressions": m.get_nb_expressions(),
+                "nb_decisions": m.get_nb_decisions(),
+                "nb_constraints": m.get_nb_constraints(),
+                "n_vehicle_sequences": n_vehicles,
+            }
             log_model_complexity(m, n_vehicles, n_routes)
             m.close()
             optimizer.param.time_limit = self.config.time_limit_seconds
@@ -294,8 +313,15 @@ class RouteAllocationOptimizer:
                 routes_total=n_routes,
                 allocation_score=obj_value,
             )
-            validate_allocation_solver_result(
+            warnings = validate_allocation_solver_result(
                 model_data, result, self.config.route_count_weight
+            )
+            write_optimizer_debug_csv(
+                allocation_model_to_optimization_data(model_data),
+                config=self.config,
+                result=result,
+                model_stats=model_stats,
+                validation_warnings=warnings,
             )
             return result
 
@@ -344,8 +370,14 @@ class RouteAllocationOptimizer:
             routes_total=n_routes,
             allocation_score=obj,
         )
-        validate_allocation_solver_result(
+        warnings = validate_allocation_solver_result(
             model_data, result, self.config.route_count_weight
+        )
+        write_optimizer_debug_csv(
+            allocation_model_to_optimization_data(model_data),
+            config=self.config,
+            result=result,
+            validation_warnings=warnings,
         )
         return result
 
