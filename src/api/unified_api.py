@@ -50,6 +50,7 @@ from src.jobs.db_clone_scheduler import (
     start_db_clone_scheduler,
     stop_db_clone_scheduler,
 )
+from src.utils.startup_checks import run_startup_checks
 from src.optimizer.unified_optimizer import (
     MODE_FLAG_ALLOCATION,
     MODE_FLAG_CHARGE_SCHEDULING,
@@ -105,7 +106,6 @@ class DbCloneRequest(BaseModel):
         gt=0,
         description="Window length in hours when window_start is set (default: 1).",
     )
-    include_allocations: bool = Field(True, description="Include allocation tables.")
     include_scheduler: bool = Field(True, description="Include scheduler tables.")
     dry_run: bool = Field(False, description="Fetch counts only; do not write to destination.")
 
@@ -412,6 +412,7 @@ def _result_to_jsonable(result: Any) -> Dict[str, Any]:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    run_startup_checks()
     start_db_clone_scheduler()
     yield
     stop_db_clone_scheduler()
@@ -570,7 +571,6 @@ def run_db_clone(body: DbCloneRequest) -> Dict[str, Any]:
             vehicle_ids=body.vehicle_ids,
             window_start=body.window_start,
             window_hours=body.window_hours,
-            include_allocations=body.include_allocations,
             include_scheduler=body.include_scheduler,
             dry_run=body.dry_run,
             require_lock=True,

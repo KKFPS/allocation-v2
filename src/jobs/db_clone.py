@@ -1,9 +1,13 @@
 """
 Clone allocation/scheduling data from a source PostgreSQL DB to a destination DB
-for a configurable time window (default 24 hours).
+for a configurable time window (default 1 hour for VSM, forecast, price data).
+
+t_route_plan is upserted for all rows with plan_start_date_time >= now for each
+site (no upper time bound). Allocation tables (t_allocation_monitor,
+t_route_allocated, t_route_allocated_history) are not cloned.
 
 Filters mirror src/database/queries.py: site_id, client_id, vehicle_id, and
-time-bounded route / forecast / price / VSM / charge data.
+time-bounded forecast / price / VSM / charge data.
 
 Environment variables (prefix SOURCE_ / DEST_ for each connection field):
   psgrsql_db_host, psgrsql_db_user, psgrsql_db_pswd, psgrsql_db_name, psgrsql_db_port
@@ -71,19 +75,13 @@ class CloneFilters:
     window_start: datetime
     window_end: datetime
     lookback_start: datetime
-    include_allocations: bool = True
+    route_plan_from: datetime
     include_scheduler: bool = True
 
     @property
     def vehicle_filter_sql(self) -> str:
         if self.vehicle_ids:
             return "AND v.vehicle_id = ANY(%(vehicle_ids)s)"
-        return ""
-
-    @property
-    def vehicle_filter_sql_plain(self) -> str:
-        if self.vehicle_ids:
-            return "AND vehicle_id = ANY(%(vehicle_ids)s)"
         return ""
 
 
@@ -208,6 +206,7 @@ def base_params(filters: CloneFilters) -> dict:
         "window_start": filters.window_start,
         "window_end": filters.window_end,
         "lookback_start": filters.lookback_start,
+        "route_plan_from": filters.route_plan_from,
         "forecast_method_id": FORECAST_METHOD_ID,
     }
 
@@ -215,7 +214,6 @@ def base_params(filters: CloneFilters) -> dict:
 def build_select_queries(filters: CloneFilters) -> List[Tuple[str, str]]:
     """Return (table_name, select_sql) pairs in dependency order."""
     vf = filters.vehicle_filter_sql
-    vfp = filters.vehicle_filter_sql_plain
     queries: List[Tuple[str, str]] = []
 
     client_site_filter = ""
@@ -282,107 +280,14 @@ def build_select_queries(filters: CloneFilters) -> List[Tuple[str, str]]:
     queries.append(
         (
             "t_route_plan",
-            f"""
+            """
             SELECT rp.*
             FROM t_route_plan rp
             WHERE rp.site_id = ANY(%(site_ids)s)
-              AND (
-                (rp.plan_start_date_time >= %(window_start)s
-                 AND rp.plan_start_date_time <= %(window_end)s)
-                OR rp.route_id IN (
-                    SELECT DISTINCT vsm.route_id
-                    FROM t_vsm vsm
-                    INNER JOIN t_vehicle v ON v.vehicle_id = vsm.vehicle_id
-                    WHERE v.site_id = ANY(%(site_ids)s)
-                      {vf}
-                      AND vsm.route_id IS NOT NULL
-                      AND vsm.date_time >= %(lookback_start)s
-                      AND vsm.date_time <= %(window_end)s
-                )
-              )
+              AND rp.plan_start_date_time >= %(route_plan_from)s
             """,
         )
     )
-
-    if filters.include_allocations:
-        queries.append(
-            (
-                "t_allocation_monitor",
-                """
-                SELECT am.*
-                FROM t_allocation_monitor am
-                WHERE am.site_id = ANY(%(site_ids)s)
-                  AND am.run_datetime >= %(window_start)s
-                  AND am.run_datetime <= %(window_end)s
-                """,
-            )
-        )
-
-        queries.append(
-            (
-                "t_route_allocated",
-                f"""
-                SELECT ra.*
-                FROM t_route_allocated ra
-                INNER JOIN t_route_plan rp
-                    ON ra.route_id = rp.route_id AND ra.site_id = rp.site_id
-                WHERE ra.site_id = ANY(%(site_ids)s)
-                  AND (
-                    (rp.plan_start_date_time >= %(window_start)s
-                     AND rp.plan_start_date_time <= %(window_end)s)
-                    OR rp.route_id IN (
-                        SELECT DISTINCT vsm.route_id
-                        FROM t_vsm vsm
-                        INNER JOIN t_vehicle v ON v.vehicle_id = vsm.vehicle_id
-                        WHERE v.site_id = ANY(%(site_ids)s)
-                          {vf}
-                          AND vsm.route_id IS NOT NULL
-                          AND vsm.date_time >= %(lookback_start)s
-                          AND vsm.date_time <= %(window_end)s
-                    )
-                  )
-                """,
-            )
-        )
-
-        queries.append(
-            (
-                "t_route_allocated_history",
-                f"""
-                SELECT rah.*
-                FROM t_route_allocated_history rah
-                WHERE rah.site_id = ANY(%(site_ids)s)
-                  AND (
-                    rah.allocation_id IN (
-                        SELECT am.allocation_id
-                        FROM t_allocation_monitor am
-                        WHERE am.site_id = ANY(%(site_ids)s)
-                          AND am.run_datetime >= %(window_start)s
-                          AND am.run_datetime <= %(window_end)s
-                    )
-                    OR rah.route_id IN (
-                        SELECT rp.route_id
-                        FROM t_route_plan rp
-                        WHERE rp.site_id = ANY(%(site_ids)s)
-                          AND (
-                            (rp.plan_start_date_time >= %(window_start)s
-                             AND rp.plan_start_date_time <= %(window_end)s)
-                            OR rp.route_id IN (
-                                SELECT DISTINCT vsm.route_id
-                                FROM t_vsm vsm
-                                INNER JOIN t_vehicle v ON v.vehicle_id = vsm.vehicle_id
-                                WHERE v.site_id = ANY(%(site_ids)s)
-                                  {vf}
-                                  AND vsm.route_id IS NOT NULL
-                                  AND vsm.date_time >= %(lookback_start)s
-                                  AND vsm.date_time <= %(window_end)s
-                            )
-                          )
-                    )
-                  )
-                """,
-            )
-        )
 
     queries.append(
         (
@@ -491,12 +396,9 @@ TABLE_PRIMARY_KEYS: Dict[str, List[str]] = {
     "t_vehicle_telematics": ["telematic_id", "vehicle_id"],
     "t_charger": ["charger_id"],
     "t_route_plan": ["route_id"],
-    "t_route_allocated": ["route_id"],
-    "t_route_allocated_history": ["id"],
     "t_vsm": ["vehicle_id", "date_time"],
     "t_vehicle_charge": ["charger_id", "vehicle_id", "start_date_time"],
     "t_site_energy_forecast_history": ["id"],
-    "t_allocation_monitor": ["allocation_id"],
     "t_scheduler": ["schedule_id"],
     "t_charge_schedule": ["schedule_id", "vehicle_id", "charge_start_date_time"],
 }
@@ -653,13 +555,13 @@ def run_clone(
     vehicle_ids: Optional[List[int]] = None,
     window_start: datetime,
     window_hours: float = 1.0,
-    include_allocations: bool = True,
     include_scheduler: bool = True,
     dry_run: bool = False,
 ) -> CloneStats:
     """Clone source → destination for the given sites and time window."""
     window_end = window_start + timedelta(hours=window_hours)
     lookback_start = window_start - timedelta(hours=CHARGER_VSM_LOOKBACK_HOURS)
+    route_plan_from = datetime.now().replace(microsecond=0)
 
     source = DbCloneClient(DbConfig.from_env("SOURCE_"), "source")
     dest = DbCloneClient(DbConfig.from_env("DEST_"), "destination")
@@ -682,7 +584,7 @@ def run_clone(
             window_start=window_start,
             window_end=window_end,
             lookback_start=lookback_start,
-            include_allocations=include_allocations,
+            route_plan_from=route_plan_from,
             include_scheduler=include_scheduler,
         )
 
@@ -692,6 +594,7 @@ def run_clone(
         logger.info("Client ID:     %s", client_id)
         logger.info("Vehicle IDs:   %s", vehicle_ids or "all")
         logger.info("Window:        %s → %s", window_start, window_end)
+        logger.info("Route plan from: %s (no upper bound)", route_plan_from)
         logger.info("VSM/charge lookback from: %s", lookback_start)
         logger.info("Dry run:       %s", dry_run)
         logger.info("=" * 60)
@@ -736,11 +639,6 @@ def parse_args() -> argparse.Namespace:
         help="Window length in hours (default: 24)",
     )
     parser.add_argument(
-        "--no-allocations",
-        action="store_true",
-        help="Skip t_allocation_monitor, t_route_allocated, t_route_allocated_history",
-    )
-    parser.add_argument(
         "--no-scheduler",
         action="store_true",
         help="Skip t_scheduler and t_charge_schedule",
@@ -770,7 +668,6 @@ def main() -> int:
                 vehicle_ids=parse_vehicle_ids(args.vehicle_ids),
                 window_start=window_start,
                 window_hours=args.window_hours,
-                include_allocations=not args.no_allocations,
                 include_scheduler=not args.no_scheduler,
                 dry_run=args.dry_run,
             )
@@ -785,6 +682,7 @@ def main() -> int:
                 resolved_site_ids = resolve_site_ids(source, args.client_id, args.site_id)
                 window_end = window_start + timedelta(hours=args.window_hours)
                 lookback_start = window_start - timedelta(hours=CHARGER_VSM_LOOKBACK_HOURS)
+                route_plan_from = datetime.now().replace(microsecond=0)
                 filters = CloneFilters(
                     site_ids=resolved_site_ids,
                     client_id=args.client_id,
@@ -792,7 +690,7 @@ def main() -> int:
                     window_start=window_start,
                     window_end=window_end,
                     lookback_start=lookback_start,
-                    include_allocations=not args.no_allocations,
+                    route_plan_from=route_plan_from,
                     include_scheduler=not args.no_scheduler,
                 )
 
@@ -802,6 +700,7 @@ def main() -> int:
                 logger.info("Client ID:     %s", args.client_id)
                 logger.info("Vehicle IDs:   %s", filters.vehicle_ids or "all")
                 logger.info("Window:        %s → %s", window_start, window_end)
+                logger.info("Route plan from: %s (no upper bound)", route_plan_from)
                 logger.info("VSM/charge lookback from: %s", lookback_start)
                 logger.info("Dry run:       %s", args.dry_run)
                 logger.info("=" * 60)

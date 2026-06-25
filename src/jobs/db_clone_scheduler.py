@@ -93,7 +93,6 @@ def execute_db_clone(
     vehicle_ids: Optional[List[int]] = None,
     window_start: Optional[datetime] = None,
     window_hours: float = 1.0,
-    include_allocations: bool = True,
     include_scheduler: bool = True,
     dry_run: bool = False,
     require_lock: bool = True,
@@ -129,7 +128,6 @@ def execute_db_clone(
             vehicle_ids=vehicle_ids,
             window_start=window_start,
             window_hours=window_hours,
-            include_allocations=include_allocations,
             include_scheduler=include_scheduler,
             dry_run=dry_run,
         )
