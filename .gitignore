@@ -27,6 +27,7 @@ ENV/
 
 # Environment variables
 .env
+azure-app-settings.json
 
 # IDE
 .vscode/

@@ -1,9 +1,19 @@
 """Configuration management for allocation system."""
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 # Database Configuration
 DB_CONFIG = {
@@ -40,6 +50,12 @@ CLOUD_SECRET = {cloud_secret}
 # Application Configuration
 APPLICATION_NAME = os.getenv('WEBSITE_SITE_NAME', 'vehicle_allocation_system')
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Hourly source → destination DB clone (in-process scheduler)
+CLONE_DB_SCHEDULER_ENABLED = _env_truthy("CLONE_DB_SCHEDULER_ENABLED")
+CLONE_SITE_IDS = os.getenv("CLONE_SITE_IDS", "")
+_clone_client_id = os.getenv("CLONE_CLIENT_ID", "").strip()
+CLONE_CLIENT_ID = int(_clone_client_id) if _clone_client_id else None
 
 # Default System Parameters
 DEFAULT_ALLOCATION_WINDOW_HOURS = 18

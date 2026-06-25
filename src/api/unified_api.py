@@ -5,6 +5,7 @@ Run the server from project root:
 
 Endpoints:
   POST /optimize/unified   - body: UnifiedOptimizationRequest (JSON), all params optional except site_id
+  POST /clone/db           - body: DbCloneRequest (JSON), manual source → destination DB clone
   GET  /report/schedule   - query: schedule_id, optional timestamp (as-of time for report)
   GET  /health            - health check
 
@@ -17,8 +18,19 @@ Examples:
   # Get schedule report (timestamp optional; default is now)
   curl "http://localhost:8000/report/schedule?schedule_id=1"
   curl "http://localhost:8000/report/schedule?schedule_id=1&timestamp=2026-02-16T06:00:00"
+
+  # Clone previous UTC hour (uses CLONE_SITE_IDS when site_ids omitted)
+  curl -X POST http://localhost:8000/clone/db \\
+    -H "Content-Type: application/json" \\
+    -d '{}'
+
+  # Clone a custom window
+  curl -X POST http://localhost:8000/clone/db \\
+    -H "Content-Type: application/json" \\
+    -d '{"site_ids": [10, 11], "window_start": "2026-06-25 14:00:00", "window_hours": 1}'
 """
 
+from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
 from src.utils.logging_config import logger
@@ -28,8 +40,16 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, validator
 
+from src.config import CLONE_CLIENT_ID, CLONE_SITE_IDS
 from src.controllers.unified_controller import UnifiedController
 from src.integrations.microlise import MicroLiseClient, MicroLiseParams
+from src.jobs.db_clone import parse_site_ids
+from src.jobs.db_clone_scheduler import (
+    DbCloneInProgressError,
+    execute_db_clone,
+    start_db_clone_scheduler,
+    stop_db_clone_scheduler,
+)
 from src.optimizer.unified_optimizer import (
     MODE_FLAG_ALLOCATION,
     MODE_FLAG_CHARGE_SCHEDULING,
@@ -56,6 +76,60 @@ def _default_mode_flags() -> List[OptimizationModeFlag]:
         OptimizationModeFlag.charge_scheduling,
         OptimizationModeFlag.charger_allocation,
     ]
+
+
+class DbCloneRequest(BaseModel):
+    """Request body for manual source → destination DB clone."""
+
+    site_ids: Optional[List[int]] = Field(
+        None,
+        description="Sites to clone. Defaults to CLONE_SITE_IDS env when omitted.",
+    )
+    client_id: Optional[int] = Field(
+        None,
+        description="Optional client ID to validate site ownership. Defaults to CLONE_CLIENT_ID env.",
+    )
+    vehicle_ids: Optional[List[int]] = Field(
+        None,
+        description="Optional vehicle IDs to restrict the clone.",
+    )
+    window_start: Optional[datetime] = Field(
+        None,
+        description=(
+            "Window start (UTC). ISO 8601 or 'YYYY-MM-DD HH:MM:SS'. "
+            "When omitted, clones the previous complete UTC hour (same as the hourly job)."
+        ),
+    )
+    window_hours: float = Field(
+        1.0,
+        gt=0,
+        description="Window length in hours when window_start is set (default: 1).",
+    )
+    include_allocations: bool = Field(True, description="Include allocation tables.")
+    include_scheduler: bool = Field(True, description="Include scheduler tables.")
+    dry_run: bool = Field(False, description="Fetch counts only; do not write to destination.")
+
+    class Config:
+        extra = "ignore"
+
+    @validator("window_start", pre=True)
+    def _parse_window_start(cls, value: Optional[str]) -> Optional[datetime]:
+        if value is None or isinstance(value, datetime):
+            return value
+
+        value = value.strip()
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            pass
+
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid window_start: {value!r}. "
+                "Use ISO 8601 (e.g. 2026-06-25T14:00:00) or 'YYYY-MM-DD HH:MM:SS'."
+            ) from exc
 
 
 class MicroliseConnectionType(str, Enum):
@@ -336,10 +410,18 @@ def _result_to_jsonable(result: Any) -> Dict[str, Any]:
     return out
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    start_db_clone_scheduler()
+    yield
+    stop_db_clone_scheduler()
+
+
 app = FastAPI(
     title="Unified Optimization API",
     description="Run combined allocation and scheduling optimization via HTTP.",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 
@@ -457,6 +539,49 @@ def get_schedule_report(
         raise HTTPException(status_code=404, detail=str(e))
     finally:
         controller.close()
+
+
+@app.post(
+    "/clone/db",
+    response_model=Dict[str, Any],
+    summary="Run DB clone manually",
+    description=(
+        "Clones allocation/scheduling data from the source DB to the destination DB. "
+        "By default syncs the previous complete UTC hour for configured sites. "
+        "Provide window_start (and optional window_hours) to clone a custom window."
+    ),
+)
+def run_db_clone(body: DbCloneRequest) -> Dict[str, Any]:
+    site_ids = body.site_ids
+    if not site_ids:
+        site_ids = parse_site_ids(CLONE_SITE_IDS)
+    if not site_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="site_ids is required (provide in body or set CLONE_SITE_IDS env)",
+        )
+
+    client_id = body.client_id if body.client_id is not None else CLONE_CLIENT_ID
+
+    try:
+        return execute_db_clone(
+            site_ids,
+            client_id=client_id,
+            vehicle_ids=body.vehicle_ids,
+            window_start=body.window_start,
+            window_hours=body.window_hours,
+            include_allocations=body.include_allocations,
+            include_scheduler=body.include_scheduler,
+            dry_run=body.dry_run,
+            require_lock=True,
+        )
+    except DbCloneInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Manual DB clone failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/health")
