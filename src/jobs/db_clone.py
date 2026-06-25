@@ -2,8 +2,8 @@
 Clone allocation/scheduling data from a source PostgreSQL DB to a destination DB
 for a configurable time window (default 1 hour for VSM, forecast, price data).
 
-t_route_plan is upserted for all rows with plan_start_date_time >= now for each
-site (no upper time bound). Allocation tables (t_allocation_monitor,
+t_route_plan, t_site_energy_forecast_history, and t_multisite_electricity_price
+are synced from the current time onwards for each site (no upper time bound). Allocation tables (t_allocation_monitor,
 t_route_allocated, t_route_allocated_history) are not cloned.
 
 Filters mirror src/database/queries.py: site_id, client_id, vehicle_id, and
@@ -75,7 +75,7 @@ class CloneFilters:
     window_start: datetime
     window_end: datetime
     lookback_start: datetime
-    route_plan_from: datetime
+    route_plan_from: datetime  # lower bound for open-ended table clones (from now)
     include_scheduler: bool = True
 
     @property
@@ -326,8 +326,7 @@ def build_select_queries(filters: CloneFilters) -> List[Tuple[str, str]]:
             SELECT sefh.*
             FROM t_site_energy_forecast_history sefh
             WHERE sefh.site_id = ANY(%(site_ids)s)
-              AND sefh.forecasted_date_time >= %(window_start)s
-              AND sefh.forecasted_date_time <= %(window_end)s
+              AND sefh.forecasted_date_time >= %(route_plan_from)s
               AND sefh.forecasting_method_id = %(forecast_method_id)s
             """,
         )
@@ -343,8 +342,7 @@ def build_select_queries(filters: CloneFilters) -> List[Tuple[str, str]]:
             f"""
             SELECT mep.*
             FROM t_multisite_electricity_price mep
-            WHERE mep.date_time >= %(window_start)s
-              AND mep.date_time <= %(window_end)s
+            WHERE mep.date_time >= %(route_plan_from)s
               {price_client_filter}
             """,
         )
@@ -456,16 +454,20 @@ def upsert_multisite_prices(
     filters: CloneFilters,
     dry_run: bool,
 ) -> int:
-    """t_multisite_electricity_price has no PK — delete window slice then insert."""
+    """t_multisite_electricity_price has no PK — replace from current time onwards."""
     if not rows:
         return 0
 
     if dry_run:
-        logger.info("[dry-run] Would replace %s rows in t_multisite_electricity_price", len(rows))
+        logger.info(
+            "[dry-run] Would replace %s rows in t_multisite_electricity_price from %s",
+            len(rows),
+            filters.route_plan_from,
+        )
         return len(rows)
 
     client_filter = ""
-    params: List[Any] = [filters.window_start, filters.window_end]
+    params: List[Any] = [filters.route_plan_from]
     if filters.client_id is not None:
         client_filter = "AND (client_id = %s OR client_id IS NULL)"
         params.append(filters.client_id)
@@ -473,7 +475,7 @@ def upsert_multisite_prices(
     dest.execute(
         f"""
         DELETE FROM t_multisite_electricity_price
-        WHERE date_time >= %s AND date_time <= %s
+        WHERE date_time >= %s
         {client_filter}
         """,
         params,
@@ -594,7 +596,7 @@ def run_clone(
         logger.info("Client ID:     %s", client_id)
         logger.info("Vehicle IDs:   %s", vehicle_ids or "all")
         logger.info("Window:        %s → %s", window_start, window_end)
-        logger.info("Route plan from: %s (no upper bound)", route_plan_from)
+        logger.info("Open-ended from: %s (route plan, energy forecast, electricity price)", route_plan_from)
         logger.info("VSM/charge lookback from: %s", lookback_start)
         logger.info("Dry run:       %s", dry_run)
         logger.info("=" * 60)
@@ -700,7 +702,7 @@ def main() -> int:
                 logger.info("Client ID:     %s", args.client_id)
                 logger.info("Vehicle IDs:   %s", filters.vehicle_ids or "all")
                 logger.info("Window:        %s → %s", window_start, window_end)
-                logger.info("Route plan from: %s (no upper bound)", route_plan_from)
+                logger.info("Open-ended from: %s (route plan, energy forecast, electricity price)", route_plan_from)
                 logger.info("VSM/charge lookback from: %s", lookback_start)
                 logger.info("Dry run:       %s", args.dry_run)
                 logger.info("=" * 60)
