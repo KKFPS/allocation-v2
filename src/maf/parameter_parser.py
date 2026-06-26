@@ -4,7 +4,12 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, Optional
 from src.utils.logging_config import logger
-from src.config import DEFAULT_PENALTIES, DEFAULT_CONSTRAINT_ENABLED
+from src.config import (
+    DEFAULT_PENALTIES,
+    DEFAULT_CONSTRAINT_ENABLED,
+    DEFAULT_PLANNING_WINDOW_HOURS,
+    DEFAULT_TARGET_SOC_PERCENT,
+)
 
 def parse_maf_parameter(param_key: str, param_value: str) -> Any:
     """
@@ -27,11 +32,11 @@ def parse_maf_parameter(param_key: str, param_value: str) -> Any:
     
     # Boolean detection
     if param_key.endswith('_enabled') or param_key.endswith('_flag') or \
-       param_value.lower() in ['true', 'false', 'yes', 'no']:
+       (isinstance(param_value, str) and param_value.lower() in ['true', 'false', 'yes', 'no']):
         return param_value.lower() in ['true', 'yes', '1']
     
     # JSON array
-    if param_value.strip().startswith('['):
+    if isinstance(param_value, str) and param_value.strip().startswith('['):
         try:
             return json.loads(param_value)
         except json.JSONDecodeError as e:
@@ -39,7 +44,7 @@ def parse_maf_parameter(param_key: str, param_value: str) -> Any:
             return param_value
     
     # JSON object
-    if param_value.strip().startswith('{'):
+    if isinstance(param_value, str) and param_value.strip().startswith('{'):
         try:
             return json.loads(param_value)
         except json.JSONDecodeError as e:
@@ -51,7 +56,7 @@ def parse_maf_parameter(param_key: str, param_value: str) -> Any:
                         '_weight', '_bonus', '_threshold', '_count', '_margin']
     if any(param_key.endswith(suffix) for suffix in numeric_suffixes):
         try:
-            if '.' not in param_value:
+            if isinstance(param_value, str) and '.' not in param_value:
                 return int(param_value)
             else:
                 return float(param_value)
@@ -60,7 +65,7 @@ def parse_maf_parameter(param_key: str, param_value: str) -> Any:
             return None
     
     # Time format detection
-    if ':' in param_value and param_key.endswith('_period'):
+    if isinstance(param_value, str) and ':' in param_value and param_key.endswith('_period'):
         try:
             return datetime.strptime(param_value, '%H:%M:%S').time()
         except ValueError as e:
@@ -179,6 +184,39 @@ def parse_maf_response(maf_json: Dict) -> Dict[int, Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Failed to parse MAF response: {e}")
         return {}
+
+
+def resolve_site_config(site_configs: Dict, site_id: int) -> Dict[str, Any]:
+    """
+    Select a single site's configuration from a parse_maf_response result.
+
+    Site keys may be int or str depending on MAF JSON encoding.
+    """
+    empty = {'parameters': {}, 'enabled_vehicles': []}
+    if not site_configs:
+        return empty
+    for key in (site_id, str(site_id)):
+        if key in site_configs:
+            return site_configs[key]
+    try:
+        int_key = int(site_id)
+        if int_key in site_configs:
+            return site_configs[int_key]
+    except (TypeError, ValueError):
+        pass
+    return empty
+
+
+def get_scheduler_params_from_site_config(site_config: Dict) -> Dict[str, Any]:
+    """Site-level scheduler parameters from MAF (with code defaults)."""
+    return {
+        'planning_window_hours': get_site_parameter(
+            site_config, 'planning_window_hours', DEFAULT_PLANNING_WINDOW_HOURS
+        ),
+        'target_soc_percent': get_site_parameter(
+            site_config, 'target_soc_percent', DEFAULT_TARGET_SOC_PERCENT
+        ),
+    }
 
 
 def get_site_parameter(site_config: Dict, param_key: str, default: Any = None) -> Any:

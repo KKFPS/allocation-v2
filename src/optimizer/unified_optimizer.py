@@ -10,8 +10,8 @@ Objective (weighted sum):
 
 Where:
     - route_allocation_score = W_route * routes_covered + sequence_scores
-    - charging_cost = Σ (price + synthetic) * energy
-    - shortfall_penalty = λ * Σ shortfall_from_target_soc
+    - charging_cost = Σ (price + synthetic + triad) * energy per slot
+    - shortfall_penalty = λ * Σ shortfall_from_target_soc (per-slot on timeslot model)
 """
 import hexaly.optimizer as hx
 import numpy as np
@@ -28,7 +28,13 @@ from src.models.scheduler import (
 from src.models.vehicle import Vehicle
 from src.models.route import Route
 from src.utils.logging_config import logger
-from src.config import IS_HEXALY_ACTIVE
+from src.config import (
+    IS_HEXALY_ACTIVE,
+    UNIFIED_MAKESPAN_PENALTY_WEIGHT,
+    UNIFIED_SOC_SHORTFALL_PENALTY,
+    UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR,
+    UNIFIED_TRIAD_PENALTY_FACTOR,
+)
 from src.optimizer.unified_optimizer_debug import (
     DEBUG_EXPORT_UNIFIED_MATRICES_CSV,
     export_unified_debug_matrices_csv,
@@ -150,9 +156,9 @@ class UnifiedOptimizationConfig:
     
     # Scheduling weights
     scheduling_cost_weight: float = 1.0  # β: weight for charging cost term
-    target_soc_shortfall_penalty: float = 0.2  # λ: penalty per kWh shortfall
-    triad_penalty_factor: float = 100.0  # Kept for API compatibility; not used in objective
-    synthetic_time_price_factor: float = 0.01
+    target_soc_shortfall_penalty: float = UNIFIED_SOC_SHORTFALL_PENALTY  # λ: per kWh shortfall
+    triad_penalty_factor: float = UNIFIED_TRIAD_PENALTY_FACTOR
+    synthetic_time_price_factor: float = UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR
     
     # Target SOC
     target_soc_percent: float = 75.0
@@ -164,7 +170,7 @@ class UnifiedOptimizationConfig:
     enable_charger_allocation: bool = True  # Enable charger allocation constraints (C1-C5)
     
     # Interval scheduling parameters
-    makespan_penalty_weight: float = 0.1  # Weight for completion time in objective
+    makespan_penalty_weight: float = UNIFIED_MAKESPAN_PENALTY_WEIGHT  # Penalize late session starts
     min_session_duration_minutes: int = 30  # Minimum charging session length
 
 
@@ -438,6 +444,160 @@ class UnifiedOptimizer:
             return OptimizationMode.INTEGRATED
         else:
             raise ValueError("Insufficient data for any optimization mode")
+
+    def _slot_unit_cost(
+        self,
+        slot_idx: int,
+        n_slots: int,
+        slot_time: datetime,
+        price_data: Dict[datetime, Tuple[float, bool]],
+    ) -> float:
+        """Electricity + synthetic early-charge + TRIAD cost per kWh for a slot."""
+        price, is_triad = price_data.get(slot_time, (0.15, False))
+        synthetic_price = (
+            self.config.synthetic_time_price_factor * (n_slots - slot_idx) / max(n_slots, 1)
+        )
+        triad_cost = self.config.triad_penalty_factor if is_triad else 0.0
+        return price + synthetic_price + triad_cost
+
+    def _target_soc_kwh(self, state: VehicleChargeState) -> float:
+        return (float(self.config.target_soc_percent) / 100.0) * state.battery_capacity_kwh
+
+    def _min_energy_to_target(self, state: VehicleChargeState) -> float:
+        return max(0.0, self._target_soc_kwh(state) - state.current_soc_kwh)
+
+    def _build_fixed_slot_intervals(self, model, n_slots: int, slot_minutes: int = 30) -> List:
+        """Fixed 30-minute slot intervals for overlap-based energy costing."""
+        slot_intervals = []
+        for t_idx in range(n_slots):
+            slot_start = t_idx * slot_minutes
+            slot_iv = model.interval_var(slot_start, slot_start + slot_minutes)
+            slot_iv.duration_min = slot_minutes
+            slot_iv.duration_max = slot_minutes
+            slot_intervals.append(slot_iv)
+        return slot_intervals
+
+    def _build_interval_charging_cost_terms(
+        self,
+        model,
+        charging_sessions: List,
+        vehicles: List[Vehicle],
+        vehicle_states: Dict[int, VehicleChargeState],
+        time_slots: List[datetime],
+        price_data: Dict[datetime, Tuple[float, bool]],
+        slot_intervals: List,
+    ) -> List:
+        """Slot-aware charging cost for interval sessions (price + synthetic + TRIAD)."""
+        n_slots = len(time_slots)
+        cost_terms = []
+        for v_idx, vehicle in enumerate(vehicles):
+            state = vehicle_states.get(vehicle.vehicle_id)
+            if not state or state.ac_charge_rate_kw <= 0:
+                continue
+            charge_rate_kw = state.ac_charge_rate_kw
+            for t_idx, slot_time in enumerate(time_slots):
+                slot_cost = self._slot_unit_cost(t_idx, n_slots, slot_time, price_data)
+                overlap_minutes = model.overlap_length(charging_sessions[v_idx], slot_intervals[t_idx])
+                energy_in_slot = (charge_rate_kw / 60.0) * overlap_minutes
+                cost_terms.append(slot_cost * energy_in_slot)
+        return cost_terms
+
+    def _build_interval_start_penalty_terms(
+        self,
+        model,
+        charging_sessions: List,
+        n_vehicles: int,
+        planning_horizon_minutes: int,
+    ) -> List:
+        """Penalize late session starts to encourage earlier charging."""
+        if self.config.makespan_penalty_weight <= 0 or planning_horizon_minutes <= 0:
+            return []
+        scale = self.config.makespan_penalty_weight / max(planning_horizon_minutes, 1)
+        return [scale * model.start(charging_sessions[v_idx]) for v_idx in range(n_vehicles)]
+
+    def _build_final_target_soc_shortfall_terms(
+        self,
+        model,
+        vehicles: List[Vehicle],
+        vehicle_states: Dict[int, VehicleChargeState],
+        final_energy_by_vehicle: List,
+    ) -> List:
+        """Soft penalty for kWh shortfall from target SOC at end of planning horizon."""
+        shortfall_terms = []
+        penalty = self.config.target_soc_shortfall_penalty
+        for v_idx, vehicle in enumerate(vehicles):
+            state = vehicle_states.get(vehicle.vehicle_id)
+            if not state:
+                continue
+            min_energy = self._min_energy_to_target(state)
+            if min_energy <= 0:
+                continue
+            shortfall_v = model.float(0, min_energy)
+            model.constraint(
+                shortfall_v >= min_energy - final_energy_by_vehicle[v_idx]
+            )
+            shortfall_terms.append(penalty * shortfall_v)
+        return shortfall_terms
+
+    def _build_timeslot_target_soc_shortfall_terms(
+        self,
+        model,
+        vehicles: List[Vehicle],
+        vehicle_states: Dict[int, VehicleChargeState],
+        cumulative_energy: List[List],
+        n_slots: int,
+    ) -> List:
+        """Per-slot shortfall penalties to keep SOC close to target throughout the day."""
+        shortfall_terms = []
+        penalty = self.config.target_soc_shortfall_penalty / max(n_slots, 1)
+        for v_idx, vehicle in enumerate(vehicles):
+            state = vehicle_states.get(vehicle.vehicle_id)
+            if not state:
+                continue
+            min_energy = self._min_energy_to_target(state)
+            if min_energy <= 0:
+                continue
+            for t_idx in range(n_slots):
+                shortfall_t = model.float(0, min_energy)
+                model.constraint(
+                    shortfall_t >= min_energy - cumulative_energy[t_idx][v_idx]
+                )
+                shortfall_terms.append(penalty * shortfall_t)
+        return shortfall_terms
+
+    def _build_timeslot_charging_cost_terms(
+        self,
+        charge_power: List[List],
+        vehicles: List[Vehicle],
+        time_slots: List[datetime],
+        price_data: Dict[datetime, Tuple[float, bool]],
+        n_vehicles: int,
+    ) -> List:
+        """Per-slot charging cost (price + synthetic + TRIAD) for timeslot model."""
+        n_slots = len(time_slots)
+        cost_terms = []
+        for t_idx, slot_time in enumerate(time_slots):
+            slot_cost = self._slot_unit_cost(t_idx, n_slots, slot_time, price_data)
+            for v_idx in range(n_vehicles):
+                energy_this_slot = charge_power[t_idx][v_idx] * 0.5
+                cost_terms.append(slot_cost * energy_this_slot)
+        return cost_terms
+
+    def _add_target_soc_hard_constraints(
+        self,
+        model,
+        vehicles: List[Vehicle],
+        vehicle_states: Dict[int, VehicleChargeState],
+        energy_by_vehicle: List,
+    ) -> None:
+        """Hard constraint: deliver enough energy to reach target SOC when below target."""
+        for v_idx, vehicle in enumerate(vehicles):
+            state = vehicle_states.get(vehicle.vehicle_id)
+            if not state:
+                continue
+            min_energy = self._min_energy_to_target(state)
+            if min_energy > 0:
+                model.constraint(energy_by_vehicle[v_idx] >= min_energy)
     
     def _solve_allocation_only(
         self,
@@ -620,47 +780,23 @@ class UnifiedOptimizer:
             elif site_chargers and not self.config.enable_charger_allocation:
                 logger.info(f"[UNIFIED:SCHED] Charger allocation DISABLED by config (site has {len(site_chargers)} power classes)")
             
-            # Build objective: minimize charging cost + shortfall penalty
-            # Calculate average price for simplicity (weighted by time would be more accurate)
-            avg_price = sum(price_data.get(slot, (0.15, False))[0] for slot in time_slots) / len(time_slots) if time_slots else 0.15
+            slot_intervals = self._build_fixed_slot_intervals(model, n_slots)
+            cost_terms = self._build_interval_charging_cost_terms(
+                model, charging_sessions, vehicles, vehicle_states,
+                time_slots, price_data, slot_intervals,
+            )
+            shortfall_terms = self._build_final_target_soc_shortfall_terms(
+                model, vehicles, vehicle_states, energy_charged,
+            )
+            timing_terms = self._build_interval_start_penalty_terms(
+                model, charging_sessions, n_vehicles, planning_horizon_minutes,
+            )
             
-            cost_terms = []
-            for v_idx in range(n_vehicles):
-                # Cost = average_price * energy_charged
-                cost = avg_price * energy_charged[v_idx]
-                cost_terms.append(cost)
-            
-            # Shortfall penalty (soft target SOC)
-            shortfall_terms = []
-            for v_idx, vehicle in enumerate(vehicles):
-                state = vehicle_states.get(vehicle.vehicle_id)
-                if not state:
-                    continue
-                
-                target_soc_kwh = (self.config.target_soc_percent / 100.0) * state.battery_capacity_kwh
-                max_shortfall = max(0.0, target_soc_kwh - state.current_soc_kwh)
-                
-                if max_shortfall > 0:
-                    shortfall_v = model.float(0, max_shortfall)
-                    model.constraint(
-                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - energy_charged[v_idx]
-                    )
-                    shortfall_terms.append(self.config.target_soc_shortfall_penalty * shortfall_v)
-            
-            # Optional makespan penalty
-            makespan_terms = []
-            if self.config.makespan_penalty_weight > 0:
-                for v_idx in range(n_vehicles):
-                    if model.if_present(charging_sessions[v_idx]):
-                        makespan_terms.append(model.end(charging_sessions[v_idx]))
-            
-            # Combine objective terms
-            objective = model.sum(cost_terms)
+            objective = model.sum(cost_terms) if cost_terms else model.float(0, 0)
             if shortfall_terms:
                 objective = objective + model.sum(shortfall_terms)
-            if makespan_terms:
-                makespan = model.max(makespan_terms)
-                objective = objective + self.config.makespan_penalty_weight * makespan
+            if timing_terms:
+                objective = objective + model.sum(timing_terms)
             
             model.minimize(objective)
             
@@ -670,6 +806,9 @@ class UnifiedOptimizer:
                 availability_matrices, time_slots, forecast_data,
                 charging_sessions, energy_charged, vehicle_to_idx, site_chargers,
                 power_class_choice, planning_horizon_minutes
+            )
+            self._add_target_soc_hard_constraints(
+                model, vehicles, vehicle_states, energy_charged,
             )
             
             model.close()
@@ -902,48 +1041,25 @@ class UnifiedOptimizer:
             else:
                 allocation_term = allocation_score_term
             
-            # Scheduling term: charging cost
-            # Calculate average price for simplicity
-            avg_price = sum(price_data.get(slot, (0.15, False))[0] for slot in time_slots) / len(time_slots) if time_slots else 0.15
+            slot_intervals = self._build_fixed_slot_intervals(model, n_slots)
+            cost_terms = self._build_interval_charging_cost_terms(
+                model, charging_sessions, vehicles, vehicle_states,
+                time_slots, price_data, slot_intervals,
+            )
+            shortfall_terms = self._build_final_target_soc_shortfall_terms(
+                model, vehicles, vehicle_states, energy_charged,
+            )
+            timing_terms = self._build_interval_start_penalty_terms(
+                model, charging_sessions, n_vehicles, planning_horizon_minutes,
+            )
             
-            cost_terms = []
-            for v_idx in range(n_vehicles):
-                # Cost = average_price * energy_charged
-                cost = avg_price * energy_charged[v_idx]
-                cost_terms.append(cost)
-            
-            # Shortfall penalty
-            shortfall_terms = []
-            for v_idx, vehicle in enumerate(vehicles):
-                state = vehicle_states.get(vehicle.vehicle_id)
-                if not state:
-                    continue
-                
-                target_soc_kwh = (self.config.target_soc_percent / 100.0) * state.battery_capacity_kwh
-                max_shortfall = max(0.0, target_soc_kwh - state.current_soc_kwh)
-                
-                if max_shortfall > 0:
-                    shortfall_v = model.float(0, max_shortfall)
-                    model.constraint(
-                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - energy_charged[v_idx]
-                    )
-                    shortfall_terms.append(self.config.target_soc_shortfall_penalty * shortfall_v)
-            
-            scheduling_term = model.sum(cost_terms)
+            scheduling_term = model.sum(cost_terms) if cost_terms else model.float(0, 0)
             if shortfall_terms:
                 scheduling_term = scheduling_term + model.sum(shortfall_terms)
-            
-            # Optional makespan penalty
-            if self.config.makespan_penalty_weight > 0:
-                makespan_terms = []
-                for v_idx in range(n_vehicles):
-                    makespan_terms.append(model.end(charging_sessions[v_idx]))
-                if makespan_terms:
-                    makespan = model.max(makespan_terms)
-                    scheduling_term = scheduling_term + self.config.makespan_penalty_weight * makespan
+            if timing_terms:
+                scheduling_term = scheduling_term + model.sum(timing_terms)
             
             # Combined weighted sum: maximize allocation - cost
-            # Note: We maximize, so subtract the cost term
             combined_objective = (
                 self.config.allocation_score_weight * allocation_term -
                 self.config.scheduling_cost_weight * scheduling_term
@@ -956,6 +1072,9 @@ class UnifiedOptimizer:
                 availability_matrices, time_slots, forecast_data,
                 charging_sessions, energy_charged, vehicle_to_idx, site_chargers,
                 power_class_choice, planning_horizon_minutes
+            )
+            self._add_target_soc_hard_constraints(
+                model, vehicles, vehicle_states, energy_charged,
             )
             
             model.close()
@@ -1067,38 +1186,17 @@ class UnifiedOptimizer:
             elif site_chargers and not self.config.enable_charger_allocation:
                 logger.info(f"[UNIFIED:SCHED:TIMESLOT] Charger allocation DISABLED by config (site has {len(site_chargers)} power classes)")
             
-            # Build objective: minimize charging cost + shortfall penalty
-            cost_terms = []
-            for t_idx, slot_time in enumerate(time_slots):
-                price, _ = price_data.get(slot_time, (0.15, False))
-                synthetic_price = self.config.synthetic_time_price_factor * (n_slots - t_idx) / n_slots
-                slot_cost = price + synthetic_price
-                
-                for v_idx in range(n_vehicles):
-                    energy_this_slot = charge_power[t_idx][v_idx] * 0.5
-                    cost_terms.append(slot_cost * energy_this_slot)
+            cost_terms = self._build_timeslot_charging_cost_terms(
+                charge_power, vehicles, time_slots, price_data, n_vehicles,
+            )
+            shortfall_terms = self._build_timeslot_target_soc_shortfall_terms(
+                model, vehicles, vehicle_states, cumulative_energy, n_slots,
+            )
             
-            # Shortfall penalty (soft target SOC)
-            shortfall_terms = []
-            for v_idx, vehicle in enumerate(vehicles):
-                state = vehicle_states.get(vehicle.vehicle_id)
-                if not state:
-                    continue
-                
-                target_soc_kwh = (self.config.target_soc_percent / 100.0) * state.battery_capacity_kwh
-                max_shortfall = max(0.0, target_soc_kwh - state.current_soc_kwh)
-                
-                if max_shortfall > 0:
-                    shortfall_v = model.float(0, max_shortfall)
-                    model.constraint(
-                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - cumulative_energy[n_slots - 1][v_idx]
-                    )
-                    shortfall_terms.append(self.config.target_soc_shortfall_penalty * shortfall_v)
-            
+            objective = model.sum(cost_terms) if cost_terms else model.float(0, 0)
             if shortfall_terms:
-                model.minimize(model.sum(cost_terms) + model.sum(shortfall_terms))
-            else:
-                model.minimize(model.sum(cost_terms))
+                objective = objective + model.sum(shortfall_terms)
+            model.minimize(objective)
             
             # Constraints
             self._add_scheduling_constraints(
@@ -1106,6 +1204,10 @@ class UnifiedOptimizer:
                 availability_matrices, time_slots, forecast_data,
                 charge_power, cumulative_energy, vehicle_to_idx, site_chargers,
                 charger_assigned, charger_power_to_idx
+            )
+            self._add_target_soc_hard_constraints(
+                model, vehicles, vehicle_states,
+                [cumulative_energy[n_slots - 1][v_idx] for v_idx in range(n_vehicles)],
             )
             
             model.close()
@@ -1257,40 +1359,17 @@ class UnifiedOptimizer:
             else:
                 allocation_term = allocation_score_term
             
-            # Scheduling term: charging cost
-            cost_terms = []
-            for t_idx, slot_time in enumerate(time_slots):
-                price, _ = price_data.get(slot_time, (0.15, False))
-                synthetic_price = self.config.synthetic_time_price_factor * (n_slots - t_idx) / n_slots
-                slot_cost = price + synthetic_price
-                
-                for v_idx in range(n_vehicles):
-                    energy_this_slot = charge_power[t_idx][v_idx] * 0.5
-                    cost_terms.append(slot_cost * energy_this_slot)
+            cost_terms = self._build_timeslot_charging_cost_terms(
+                charge_power, vehicles, time_slots, price_data, n_vehicles,
+            )
+            shortfall_terms = self._build_timeslot_target_soc_shortfall_terms(
+                model, vehicles, vehicle_states, cumulative_energy, n_slots,
+            )
             
-            # Shortfall penalty
-            shortfall_terms = []
-            for v_idx, vehicle in enumerate(vehicles):
-                state = vehicle_states.get(vehicle.vehicle_id)
-                if not state:
-                    continue
-                
-                target_soc_kwh = (self.config.target_soc_percent / 100.0) * state.battery_capacity_kwh
-                max_shortfall = max(0.0, target_soc_kwh - state.current_soc_kwh)
-                
-                if max_shortfall > 0:
-                    shortfall_v = model.float(0, max_shortfall)
-                    model.constraint(
-                        shortfall_v >= target_soc_kwh - state.current_soc_kwh - cumulative_energy[n_slots - 1][v_idx]
-                    )
-                    shortfall_terms.append(self.config.target_soc_shortfall_penalty * shortfall_v)
-            
-            scheduling_term = model.sum(cost_terms)
+            scheduling_term = model.sum(cost_terms) if cost_terms else model.float(0, 0)
             if shortfall_terms:
                 scheduling_term = scheduling_term + model.sum(shortfall_terms)
             
-            # Combined weighted sum: maximize allocation - cost
-            # Note: We maximize, so subtract the cost term
             combined_objective = (
                 self.config.allocation_score_weight * allocation_term -
                 self.config.scheduling_cost_weight * scheduling_term
@@ -1303,6 +1382,10 @@ class UnifiedOptimizer:
                 availability_matrices, time_slots, forecast_data,
                 charge_power, cumulative_energy, vehicle_to_idx, site_chargers,
                 charger_assigned, charger_power_to_idx
+            )
+            self._add_target_soc_hard_constraints(
+                model, vehicles, vehicle_states,
+                [cumulative_energy[n_slots - 1][v_idx] for v_idx in range(n_vehicles)],
             )
             
             model.close()
@@ -1812,7 +1895,7 @@ class UnifiedOptimizer:
             if not state:
                 continue
             
-            target_soc_kwh = (self.config.target_soc_percent / 100.0) * state.battery_capacity_kwh
+            target_soc_kwh = (float(self.config.target_soc_percent) / 100.0) * state.battery_capacity_kwh
             if requirements:
                 route_energy = requirements[-1].cumulative_energy_kwh
                 energy_needed = max(0.0, max(route_energy, target_soc_kwh) - state.current_soc_kwh)
@@ -1998,7 +2081,7 @@ class UnifiedOptimizer:
             if not state:
                 continue
             
-            target_soc_kwh = (self.config.target_soc_percent / 100.0) * state.battery_capacity_kwh
+            target_soc_kwh = (float(self.config.target_soc_percent) / 100.0) * state.battery_capacity_kwh
             if requirements:
                 route_energy = requirements[-1].cumulative_energy_kwh
                 energy_needed = max(0.0, max(route_energy, target_soc_kwh) - state.current_soc_kwh)

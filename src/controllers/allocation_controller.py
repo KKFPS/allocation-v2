@@ -7,7 +7,7 @@ from src.database.queries import Queries
 from src.models.vehicle import Vehicle
 from src.models.route import Route
 from src.models.allocation import AllocationResult, RouteAllocation
-from src.maf.parameter_parser import parse_maf_response, get_site_parameter, get_all_constraint_configs
+from src.maf.parameter_parser import parse_maf_response, get_site_parameter, get_all_constraint_configs, resolve_site_config
 from src.constraints.constraint_manager import ConstraintManager
 from src.optimizer.cost_matrix import CostMatrixBuilder
 from src.optimizer.hexaly_solver import HexalySolver
@@ -151,7 +151,7 @@ class AllocationController:
                 name, maf_json = result[0]['sp_get_module_params']
                 logger.info(f"MAF name: {name}")
                 site_configs = parse_maf_response(maf_json)
-                self.site_config = site_configs.get(str(self.site_id), {})
+                self.site_config = resolve_site_config(site_configs, self.site_id)
                 # logger.info(f"Loaded MAF configuration for site {self.site_id} : {self.site_config}")
             else:
                 logger.warning("No MAF configuration found, using defaults")

@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.config import APPLICATION_NAME
 from src.database.connection import db
 from src.database.queries import Queries
+from src.config import DEFAULT_CONSTRAINT_ENABLED
 from src.maf.parameter_parser import (
-    DEFAULT_CONSTRAINT_ENABLED,
     get_site_parameter,
     parse_maf_parameter,
     parse_maf_response,
@@ -26,6 +26,8 @@ _SENSITIVE_NAME_RE = re.compile(
 _SITE_LEVEL_MAF_PARAMS = (
     "allocation_window_hours",
     "max_routes_per_vehicle_in_window",
+    "planning_window_hours",
+    "target_soc_percent",
 )
 
 _CONSTRAINT_NAMES = (
@@ -67,6 +69,11 @@ ENV_VAR_SPECS: Tuple[EnvVarSpec, ...] = (
     EnvVarSpec("CLONE_DB_SCHEDULER_ENABLED", default="false", group="db_clone"),
     EnvVarSpec("CLONE_SITE_IDS", group="db_clone"),
     EnvVarSpec("CLONE_CLIENT_ID", group="db_clone"),
+    # Optimizer scheduler
+    EnvVarSpec("OPTIMIZER_SCHEDULER_ENABLED", default="false", group="optimizer_scheduler"),
+    EnvVarSpec("OPTIMIZER_SITE_IDS", group="optimizer_scheduler"),
+    EnvVarSpec("OPTIMIZER_CRON_MINUTE", default="15", group="optimizer_scheduler"),
+    EnvVarSpec("OPTIMIZER_CRON_HOUR", default="*", group="optimizer_scheduler"),
     # Microlise
     EnvVarSpec("JLP_Microlise_TokenClientId", sensitive=True, group="microlise"),
     EnvVarSpec("JLP_Microlise_TokenClient_Secret", sensitive=True, group="microlise"),

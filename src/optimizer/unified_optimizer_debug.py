@@ -64,7 +64,7 @@ def export_unified_debug_matrices_csv(
                     route_coverage[route.route_id].append(seq_idx)
 
     # Model stats: decision variable counts
-    target_soc_percent = getattr(config, "target_soc_percent", 75.0)
+    target_soc_percent = float(getattr(config, "target_soc_percent", 75.0))
     n_alloc_sequence_vars = n_sequences
     n_alloc_route_covered_vars = n_routes
     n_sched_charge_power_vars = n_slots * n_vehicles
@@ -74,6 +74,7 @@ def export_unified_debug_matrices_csv(
         for v in vehicles:
             state = vehicle_states.get(v.vehicle_id)
             if state:
+                print(f"target_soc_percent: {type(target_soc_percent)}")
                 target_soc_kwh = (target_soc_percent / 100.0) * state.battery_capacity_kwh
                 if target_soc_kwh - state.current_soc_kwh > 0:
                     n_sched_shortfall_vars += 1

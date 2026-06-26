@@ -57,6 +57,13 @@ CLONE_SITE_IDS = os.getenv("CLONE_SITE_IDS", "")
 _clone_client_id = os.getenv("CLONE_CLIENT_ID", "").strip()
 CLONE_CLIENT_ID = int(_clone_client_id) if _clone_client_id else None
 
+# Scheduled unified optimization (in-process cron)
+OPTIMIZER_SCHEDULER_ENABLED = _env_truthy("OPTIMIZER_SCHEDULER_ENABLED")
+_optimizer_site_ids = os.getenv("OPTIMIZER_SITE_IDS", "").strip()
+OPTIMIZER_SITE_IDS = _optimizer_site_ids or CLONE_SITE_IDS
+OPTIMIZER_CRON_MINUTE = os.getenv("OPTIMIZER_CRON_MINUTE", "15")
+OPTIMIZER_CRON_HOUR = os.getenv("OPTIMIZER_CRON_HOUR", "*")
+
 # Default System Parameters
 DEFAULT_ALLOCATION_WINDOW_HOURS = 18
 DEFAULT_MAX_ROUTES_PER_VEHICLE = 4
@@ -125,7 +132,10 @@ MICROLISE_BLOB_DIR = os.getenv("allocation_blob_dir", "")
 UNIFIED_ALLOCATION_WEIGHT = 1.0      # α: weight for allocation term
 UNIFIED_SCHEDULING_WEIGHT = 1.0      # β: weight for scheduling cost term
 UNIFIED_ROUTE_COUNT_WEIGHT = 1e2     # Priority weight for route coverage
-UNIFIED_SOC_SHORTFALL_PENALTY = 0.2  # Penalty per kWh shortfall from target
+UNIFIED_SOC_SHORTFALL_PENALTY = 2.0  # Penalty per kWh shortfall from target (≥ typical £/kWh)
+UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR = 0.05  # Bias charging toward earlier slots
+UNIFIED_TRIAD_PENALTY_FACTOR = 100.0  # Penalty per kWh charged during TRIAD periods
+UNIFIED_MAKESPAN_PENALTY_WEIGHT = 0.5  # Penalize late charging session starts (interval model)
 
 # Unified optimizer time limits (seconds)
 UNIFIED_ALLOCATION_TIME_LIMIT = 30

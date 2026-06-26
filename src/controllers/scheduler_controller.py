@@ -15,6 +15,12 @@ from src.models.vehicle import Vehicle
 from src.models.route import Route
 from src.optimizer.charge_optimizer import ChargeOptimizer
 from src.utils.logging_config import logger
+from src.config import APPLICATION_NAME
+from src.maf.parameter_parser import (
+    parse_maf_response,
+    resolve_site_config,
+    get_scheduler_params_from_site_config,
+)
 
 
 class SchedulerController:
@@ -31,6 +37,7 @@ class SchedulerController:
         self.schedule_id = schedule_id
         self.site_id = site_id
         self.config: Optional[SchedulerConfig] = None
+        self.site_config: Dict = {'parameters': {}, 'enabled_vehicles': []}
         self.fleet_avg_efficiency: float = 0.35  # Default fallback
         
         # Connect to database
@@ -41,7 +48,9 @@ class SchedulerController:
         db.close()
 
     def run_scheduling(self, current_time: Optional[datetime] = None,
-                      route_source_mode: Optional[RouteSourceMode] = None) -> ChargeScheduleResult:
+                      route_source_mode: Optional[RouteSourceMode] = None,
+                      planning_window_hours: Optional[float] = None,
+                      target_soc_percent: Optional[float] = None) -> ChargeScheduleResult:
         """
         Execute complete scheduling workflow.
         
@@ -65,6 +74,13 @@ class SchedulerController:
             else:
                 self.config = self._create_scheduler_config(current_time)
                 self.schedule_id = self.config.schedule_id
+
+            self._load_maf_configuration()
+            self._apply_maf_scheduler_params(
+                self.config,
+                planning_window_hours_override=planning_window_hours,
+                target_soc_percent_override=target_soc_percent,
+            )
             
             # Override route source if provided
             if route_source_mode:
@@ -180,6 +196,58 @@ class SchedulerController:
         minute = (dt.minute // 30) * 30
         return dt.replace(minute=minute, second=0, microsecond=0)
     
+    def _load_maf_configuration(self) -> None:
+        """Load MAF site configuration for scheduler parameters."""
+        site_id = self.site_id or (self.config.site_id if self.config else None)
+        if not site_id:
+            logger.warning("No site_id available for MAF configuration load")
+            return
+
+        logger.info(f"Loading MAF configuration for {APPLICATION_NAME}")
+        try:
+            result = db.execute_query(
+                Queries.CALL_GET_MODULE_PARAMS,
+                (APPLICATION_NAME,),
+                fetch=True,
+            )
+            if result:
+                payload = result[0].get('sp_get_module_params')
+                if isinstance(payload, (list, tuple)) and len(payload) == 2:
+                    _, maf_json = payload
+                else:
+                    maf_json = payload
+                site_configs = parse_maf_response(maf_json)
+                self.site_config = resolve_site_config(site_configs, site_id)
+                logger.info(
+                    f"Loaded MAF config for site {site_id}: "
+                    f"{len(self.site_config.get('parameters', {}))} parameters"
+                )
+            else:
+                logger.warning("No MAF configuration found, using defaults")
+        except Exception as e:
+            logger.error(f"Failed to load MAF configuration: {e}")
+
+    def _apply_maf_scheduler_params(
+        self,
+        config: SchedulerConfig,
+        planning_window_hours_override: Optional[float] = None,
+        target_soc_percent_override: Optional[float] = None,
+    ) -> None:
+        """Apply site-level scheduler parameters from MAF."""
+        scheduler_params = get_scheduler_params_from_site_config(self.site_config)
+        if planning_window_hours_override is not None:
+            config.planning_window_hours = planning_window_hours_override
+        else:
+            config.planning_window_hours = scheduler_params['planning_window_hours']
+        if target_soc_percent_override is not None:
+            config.target_soc_percent = target_soc_percent_override
+        else:
+            config.target_soc_percent = scheduler_params['target_soc_percent']
+        logger.info(
+            f"Scheduler params: planning_window_hours={config.planning_window_hours}, "
+            f"target_soc_percent={config.target_soc_percent}"
+        )
+
     def _load_scheduler_config(self) -> SchedulerConfig:
         """Load existing scheduler configuration."""
         with db.get_cursor() as cur:

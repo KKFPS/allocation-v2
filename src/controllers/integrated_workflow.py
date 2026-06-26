@@ -93,13 +93,10 @@ class IntegratedWorkflowController:
                 
                 scheduler_controller = SchedulerController(site_id=self.site_id)
                 
-                # Override planning window if provided
-                if planning_window_hours:
-                    logger.info(f"Using custom planning window: {planning_window_hours} hours")
-                
                 self.schedule_result = scheduler_controller.run_scheduling(
                     current_time=current_time,
-                    route_source_mode=route_source_mode
+                    route_source_mode=route_source_mode,
+                    planning_window_hours=planning_window_hours,
                 )
                 
                 logger.info(f"Scheduling completed - Schedule ID: {self.schedule_result.schedule_id}")

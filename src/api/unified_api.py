@@ -50,6 +50,10 @@ from src.jobs.db_clone_scheduler import (
     start_db_clone_scheduler,
     stop_db_clone_scheduler,
 )
+from src.jobs.optimizer_scheduler import (
+    start_optimizer_scheduler,
+    stop_optimizer_scheduler,
+)
 from src.utils.startup_checks import run_startup_checks
 from src.optimizer.unified_optimizer import (
     MODE_FLAG_ALLOCATION,
@@ -169,11 +173,15 @@ class UnifiedOptimizationRequest(BaseModel):
     )
     persist_to_database: bool = Field(True, description="Whether to persist results to DB")
 
-    # Planning window
-    window_hours: float = Field(
-        24.0,
+    # Planning window (optional override; default from site MAF planning_window_hours)
+    window_hours: Optional[float] = Field(
+        None,
         gt=0,
-        description="Total planning window in hours (default: 24). Overrides site/MAF allocation_window_hours when set.",
+        description=(
+            "Total planning window in hours. When omitted, uses site MAF "
+            "planning_window_hours (scheduling/integrated) or allocation_window_hours "
+            "(allocation-only)."
+        ),
     )
 
     # Optimization config overrides (fallbacks to UnifiedOptimizationConfig defaults)
@@ -414,7 +422,9 @@ def _result_to_jsonable(result: Any) -> Dict[str, Any]:
 async def _lifespan(_app: FastAPI):
     run_startup_checks()
     start_db_clone_scheduler()
+    start_optimizer_scheduler()
     yield
+    stop_optimizer_scheduler()
     stop_db_clone_scheduler()
 
 
@@ -453,6 +463,7 @@ def run_unified_optimization(body: UnifiedOptimizationRequest) -> Dict[str, Any]
             config=config,
             persist_to_database=body.persist_to_database,
             window_hours=body.window_hours,
+            target_soc_percent_override=body.target_soc_percent,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

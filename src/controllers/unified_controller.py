@@ -12,7 +12,13 @@ from src.models.scheduler import (
     VehicleAvailability, ChargeScheduleResult, VehicleChargeSchedule,
     ChargeSlot, RouteSourceMode, ScheduleReport, VehicleScheduleReport, Charger, ChargerPowerClass
 )
-from src.maf.parameter_parser import parse_maf_response, get_site_parameter, get_all_constraint_configs
+from src.maf.parameter_parser import (
+    parse_maf_response,
+    get_site_parameter,
+    get_all_constraint_configs,
+    resolve_site_config,
+    get_scheduler_params_from_site_config,
+)
 from src.constraints.constraint_manager import ConstraintManager
 from src.optimizer.cost_matrix import CostMatrixBuilder
 from src.optimizer.unified_optimizer import (
@@ -26,7 +32,12 @@ from src.optimizer.unified_optimizer import (
 from src.config import (
     APPLICATION_NAME, DEFAULT_ALLOCATION_WINDOW_HOURS,
     DEFAULT_MAX_ROUTES_PER_VEHICLE, DEFAULT_RESERVE_VEHICLE_COUNT,
-    DEFAULT_TURNAROUND_TIME_MINUTES
+    DEFAULT_TURNAROUND_TIME_MINUTES, DEFAULT_PLANNING_WINDOW_HOURS,
+    DEFAULT_TARGET_SOC_PERCENT,
+    UNIFIED_MAKESPAN_PENALTY_WEIGHT,
+    UNIFIED_SOC_SHORTFALL_PENALTY,
+    UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR,
+    UNIFIED_TRIAD_PENALTY_FACTOR,
 )
 from src.utils.logging_config import logger
 
@@ -47,7 +58,7 @@ class UnifiedController:
         self.trigger_type = trigger_type
         self.allocation_id = None
         self.schedule_id = schedule_id
-        self.site_config = None
+        self.site_config = {'parameters': {}, 'enabled_vehicles': []}
         self.constraint_manager = None
         self.fleet_avg_efficiency: float = 0.35  # Default fallback
         
@@ -60,7 +71,8 @@ class UnifiedController:
         mode: Union[str, List[str]] = None,
         config: Optional[UnifiedOptimizationConfig] = None,
         persist_to_database: bool = True,
-        window_hours: Optional[float] = None
+        window_hours: Optional[float] = None,
+        target_soc_percent_override: Optional[float] = None,
     ) -> Tuple[Optional[AllocationResult], Optional[ChargeScheduleResult], UnifiedOptimizationResult]:
         """
         Execute complete unified optimization workflow.
@@ -72,6 +84,7 @@ class UnifiedController:
             config: Optional optimization configuration
             persist_to_database: Whether to persist results to database
             window_hours: Optional planning window length in hours (overrides site/MAF default)
+            target_soc_percent_override: Optional target SOC (overrides site/MAF default)
         
         Returns:
             Tuple of (AllocationResult, ChargeScheduleResult, UnifiedOptimizationResult)
@@ -92,15 +105,17 @@ class UnifiedController:
         )
         
         try:
-            # Phase 1: Initialization
-            self._initialize_optimization(current_time, opt_mode, window_hours_override=window_hours)
-            
-            # Phase 2: Load configuration from MAF
+            # Phase 1: Load MAF configuration (needed for window and scheduler params)
             self._load_maf_configuration()
+
+            # Phase 2: Initialize monitor records using MAF-resolved window
+            self._initialize_optimization(
+                current_time, opt_mode, window_hours_override=window_hours
+            )
             
             # Phase 3: Define planning window and load data
             window_start, window_end, actual_hours = self._calculate_planning_window(
-                current_time, window_hours_override=window_hours
+                current_time, opt_mode, window_hours_override=window_hours
             )
             
             logger.info(f"Planning window: {window_start} to {window_end} ({actual_hours:.1f} hours)")
@@ -129,6 +144,9 @@ class UnifiedController:
                 config = self._build_optimization_config(opt_mode)
             else:
                 config.mode = opt_mode
+            self._apply_maf_scheduler_params_to_config(
+                config, target_soc_percent_override=target_soc_percent_override
+            )
             config.enable_charger_allocation = enable_charger_allocation
             
             optimizer = UnifiedOptimizer(config)
@@ -210,16 +228,32 @@ class UnifiedController:
         mode_flags = normalize_mode_input(mode)
         return resolve_optimization_from_modes(mode_flags)
     
+    def _resolve_window_hours(
+        self,
+        mode: OptimizationMode,
+        window_hours_override: Optional[float] = None,
+    ) -> float:
+        """Resolve planning/allocation window hours from override, MAF, or defaults."""
+        if window_hours_override is not None:
+            return window_hours_override
+        if mode == OptimizationMode.ALLOCATION_ONLY:
+            return get_site_parameter(
+                self.site_config,
+                'allocation_window_hours',
+                DEFAULT_ALLOCATION_WINDOW_HOURS,
+            )
+        return get_site_parameter(
+            self.site_config,
+            'planning_window_hours',
+            DEFAULT_PLANNING_WINDOW_HOURS,
+        )
+
     def _initialize_optimization(
         self, current_time: datetime, mode: OptimizationMode,
         window_hours_override: Optional[float] = None
     ):
         """Initialize allocation and/or scheduling monitor records."""
-        window_hours = (
-            window_hours_override
-            if window_hours_override is not None
-            else DEFAULT_ALLOCATION_WINDOW_HOURS
-        )
+        window_hours = self._resolve_window_hours(mode, window_hours_override)
         
         # Create allocation monitor if needed
         if mode in (OptimizationMode.ALLOCATION_ONLY, OptimizationMode.INTEGRATED):
@@ -273,12 +307,18 @@ class UnifiedController:
                 fetch=True
             )
             
-            print(f"Result: {result[0]}")
             if result:
                 json_params = result[0].get('sp_get_module_params')
-                # logger.info(f"MAF name for site {self.site_id}: {name}")
-                self.site_config = parse_maf_response(json_params)
-                logger.info(f"Loaded MAF config: {len(self.site_config.get('parameters', {}))} parameters")
+                if isinstance(json_params, (list, tuple)) and len(json_params) == 2:
+                    _, maf_json = json_params
+                else:
+                    maf_json = json_params
+                site_configs = parse_maf_response(maf_json)
+                self.site_config = resolve_site_config(site_configs, self.site_id)
+                logger.info(
+                    f"Loaded MAF config for site {self.site_id}: "
+                    f"{len(self.site_config.get('parameters', {}))} parameters"
+                )
             else:
                 logger.warning("No MAF configuration found, using defaults")
                 self.site_config = {'parameters': {}, 'enabled_vehicles': []}
@@ -289,7 +329,8 @@ class UnifiedController:
     
     def _calculate_planning_window(
         self, current_time: datetime,
-        window_hours_override: Optional[float] = None
+        mode: OptimizationMode,
+        window_hours_override: Optional[float] = None,
     ) -> Tuple[datetime, datetime, float]:
         """
         Calculate effective planning window based on data availability.
@@ -297,14 +338,7 @@ class UnifiedController:
         Returns:
             Tuple of (start_time, end_time, actual_hours)
         """
-        if window_hours_override is not None:
-            window_hours = window_hours_override
-        else:
-            window_hours = get_site_parameter(
-                self.site_config,
-                'allocation_window_hours',
-                DEFAULT_ALLOCATION_WINDOW_HOURS
-            )
+        window_hours = self._resolve_window_hours(mode, window_hours_override)
         
         planning_start = current_time
         planning_target_end = current_time + timedelta(hours=window_hours)
@@ -797,9 +831,35 @@ class UnifiedController:
         logger.info(f"Loaded {len(price_data)} price data points")
         return price_data
     
+    def _apply_maf_scheduler_params_to_config(
+        self,
+        config: UnifiedOptimizationConfig,
+        target_soc_percent_override: Optional[float] = None,
+    ) -> None:
+        """Apply site-level scheduler MAF parameters to optimization config."""
+        scheduler_params = get_scheduler_params_from_site_config(self.site_config)
+        if target_soc_percent_override is not None:
+            config.target_soc_percent = target_soc_percent_override
+        else:
+            config.target_soc_percent = scheduler_params['target_soc_percent']
+        logger.info(
+            f"Scheduler params: target_soc_percent={config.target_soc_percent}, "
+            f"target_soc_shortfall_penalty={config.target_soc_shortfall_penalty}, "
+            f"synthetic_time_price_factor={config.synthetic_time_price_factor}, "
+            f"makespan_penalty_weight={config.makespan_penalty_weight}"
+        )
+
     def _build_optimization_config(self, mode: OptimizationMode) -> UnifiedOptimizationConfig:
         """Build optimization configuration from MAF parameters."""
-        config = UnifiedOptimizationConfig(mode=mode)
+        scheduler_params = get_scheduler_params_from_site_config(self.site_config)
+        config = UnifiedOptimizationConfig(
+            mode=mode,
+            target_soc_percent=scheduler_params['target_soc_percent'],
+            target_soc_shortfall_penalty=UNIFIED_SOC_SHORTFALL_PENALTY,
+            synthetic_time_price_factor=UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR,
+            triad_penalty_factor=UNIFIED_TRIAD_PENALTY_FACTOR,
+            makespan_penalty_weight=UNIFIED_MAKESPAN_PENALTY_WEIGHT,
+        )
         
         # Load site capacity for scheduling
         if mode in (OptimizationMode.SCHEDULING_ONLY, OptimizationMode.INTEGRATED):

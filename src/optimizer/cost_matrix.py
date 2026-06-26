@@ -119,7 +119,7 @@ class CostMatrixBuilder:
         self.vehicles = vehicles
         self.routes = routes
         self.constraint_manager = constraint_manager
-        self.max_routes_per_vehicle = max_routes_per_vehicle
+        self.max_routes_per_vehicle = int(max_routes_per_vehicle)
         self.vehicle_charger_map = vehicle_charger_map or {}
         
         self.n_vehicles = len(vehicles)
@@ -209,6 +209,9 @@ class CostMatrixBuilder:
         
         estimated_max = int(window_minutes // avg_route_minutes) + 1
         estimated_max = max(1, estimated_max)
+
+        print(f"estimated_max: {estimated_max} for window_minutes: {self.max_routes_per_vehicle} and avg_route_minutes: {self.n_routes}")
+        print(f"estimated_max: {type(estimated_max)} for window_minutes: {type(self.max_routes_per_vehicle)} and avg_route_minutes: {type(self.n_routes)}")
         
         return min(self.max_routes_per_vehicle, self.n_routes, estimated_max)
     
