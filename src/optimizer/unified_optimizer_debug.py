@@ -10,6 +10,7 @@ from typing import List, Dict, Tuple, Optional, Any
 
 import numpy as np
 
+from src.config import UNIFIED_TARGET_SOC_PERCENT
 from src.models.scheduler import (
     VehicleChargeState,
     RouteEnergyRequirement,
@@ -64,7 +65,7 @@ def export_unified_debug_matrices_csv(
                     route_coverage[route.route_id].append(seq_idx)
 
     # Model stats: decision variable counts
-    target_soc_percent = float(getattr(config, "target_soc_percent", 75.0))
+    target_soc_percent = float(getattr(config, "target_soc_percent", UNIFIED_TARGET_SOC_PERCENT))
     n_alloc_sequence_vars = n_sequences
     n_alloc_route_covered_vars = n_routes
     n_sched_charge_power_vars = n_slots * n_vehicles

@@ -11,7 +11,8 @@ Objective (weighted sum):
 Where:
     - route_allocation_score = W_route * routes_covered + sequence_scores
     - charging_cost = Σ (price + synthetic + triad) * energy per slot
-    - shortfall_penalty = λ * Σ shortfall_from_target_soc (per-slot on timeslot model)
+    - shortfall_penalty = λ * Σ shortfall_from_target_soc (time-slot model only;
+      interval model uses hard target SOC constraints instead)
 """
 import hexaly.optimizer as hx
 import numpy as np
@@ -30,9 +31,19 @@ from src.models.route import Route
 from src.utils.logging_config import logger
 from src.config import (
     IS_HEXALY_ACTIVE,
+    UNIFIED_ALLOCATION_SCORE_WEIGHT,
+    UNIFIED_ALLOCATION_TIME_LIMIT,
+    UNIFIED_ENABLE_CHARGER_ALLOCATION,
+    UNIFIED_INTEGRATED_TIME_LIMIT,
     UNIFIED_MAKESPAN_PENALTY_WEIGHT,
+    UNIFIED_MIN_SESSION_DURATION_MINUTES,
+    UNIFIED_ROUTE_COUNT_WEIGHT,
+    UNIFIED_SCHEDULING_COST_WEIGHT,
+    UNIFIED_SCHEDULING_TIME_LIMIT,
+    UNIFIED_SITE_CAPACITY_KW,
     UNIFIED_SOC_SHORTFALL_PENALTY,
     UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR,
+    UNIFIED_TARGET_SOC_PERCENT,
     UNIFIED_TRIAD_PENALTY_FACTOR,
 )
 from src.optimizer.unified_optimizer_debug import (
@@ -139,39 +150,62 @@ def resolve_optimization_from_modes(
     return OptimizationMode.SCHEDULING_ONLY, enable_charger_allocation
 
 
+def default_unified_optimization_config(
+    mode: OptimizationMode = OptimizationMode.INTEGRATED,
+) -> "UnifiedOptimizationConfig":
+    """Build UnifiedOptimizationConfig from src.config constants (single source of truth)."""
+    return UnifiedOptimizationConfig(
+        mode=mode,
+        allocation_time_limit=UNIFIED_ALLOCATION_TIME_LIMIT,
+        scheduling_time_limit=UNIFIED_SCHEDULING_TIME_LIMIT,
+        integrated_time_limit=UNIFIED_INTEGRATED_TIME_LIMIT,
+        route_count_weight=UNIFIED_ROUTE_COUNT_WEIGHT,
+        allocation_score_weight=UNIFIED_ALLOCATION_SCORE_WEIGHT,
+        scheduling_cost_weight=UNIFIED_SCHEDULING_COST_WEIGHT,
+        target_soc_shortfall_penalty=UNIFIED_SOC_SHORTFALL_PENALTY,
+        triad_penalty_factor=UNIFIED_TRIAD_PENALTY_FACTOR,
+        synthetic_time_price_factor=UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR,
+        target_soc_percent=UNIFIED_TARGET_SOC_PERCENT,
+        site_capacity_kw=UNIFIED_SITE_CAPACITY_KW,
+        enable_charger_allocation=UNIFIED_ENABLE_CHARGER_ALLOCATION,
+        makespan_penalty_weight=UNIFIED_MAKESPAN_PENALTY_WEIGHT,
+        min_session_duration_minutes=UNIFIED_MIN_SESSION_DURATION_MINUTES,
+    )
+
+
 @dataclass
 class UnifiedOptimizationConfig:
-    """Configuration for unified optimization."""
+    """Configuration for unified optimization. Use default_unified_optimization_config() for defaults."""
     
     mode: OptimizationMode = OptimizationMode.INTEGRATED
     
     # Time limits (seconds)
-    allocation_time_limit: int = 30
-    scheduling_time_limit: int = 300
-    integrated_time_limit: int = 330
+    allocation_time_limit: int = UNIFIED_ALLOCATION_TIME_LIMIT
+    scheduling_time_limit: int = UNIFIED_SCHEDULING_TIME_LIMIT
+    integrated_time_limit: int = UNIFIED_INTEGRATED_TIME_LIMIT
     
     # Allocation weights
-    route_count_weight: float = 1e2  # Weight for route coverage priority
-    allocation_score_weight: float = 1.0  # α: weight for allocation score term
+    route_count_weight: float = UNIFIED_ROUTE_COUNT_WEIGHT
+    allocation_score_weight: float = UNIFIED_ALLOCATION_SCORE_WEIGHT
     
     # Scheduling weights
-    scheduling_cost_weight: float = 1.0  # β: weight for charging cost term
-    target_soc_shortfall_penalty: float = UNIFIED_SOC_SHORTFALL_PENALTY  # λ: per kWh shortfall
+    scheduling_cost_weight: float = UNIFIED_SCHEDULING_COST_WEIGHT
+    target_soc_shortfall_penalty: float = UNIFIED_SOC_SHORTFALL_PENALTY
     triad_penalty_factor: float = UNIFIED_TRIAD_PENALTY_FACTOR
     synthetic_time_price_factor: float = UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR
     
     # Target SOC
-    target_soc_percent: float = 75.0
+    target_soc_percent: float = UNIFIED_TARGET_SOC_PERCENT
     
     # Site capacity
-    site_capacity_kw: float = 0.0
+    site_capacity_kw: float = UNIFIED_SITE_CAPACITY_KW
     
     # Charger allocation
-    enable_charger_allocation: bool = True  # Enable charger allocation constraints (C1-C5)
+    enable_charger_allocation: bool = UNIFIED_ENABLE_CHARGER_ALLOCATION
     
     # Interval scheduling parameters
-    makespan_penalty_weight: float = UNIFIED_MAKESPAN_PENALTY_WEIGHT  # Penalize late session starts
-    min_session_duration_minutes: int = 30  # Minimum charging session length
+    makespan_penalty_weight: float = UNIFIED_MAKESPAN_PENALTY_WEIGHT
+    min_session_duration_minutes: int = UNIFIED_MIN_SESSION_DURATION_MINUTES
 
 
 @dataclass
@@ -466,6 +500,60 @@ class UnifiedOptimizer:
     def _min_energy_to_target(self, state: VehicleChargeState) -> float:
         return max(0.0, self._target_soc_kwh(state) - state.current_soc_kwh)
 
+    def _min_possible_charge_rate_kw(
+        self,
+        vehicle_max_rate_kw: float,
+        site_chargers: Optional[List[ChargerPowerClass]],
+    ) -> float:
+        """Lower bound on deliverable kW when charger-class assignment is enabled."""
+        if not site_chargers or not self.config.enable_charger_allocation:
+            return vehicle_max_rate_kw
+        class_rates = [
+            min(vehicle_max_rate_kw, pc.max_power_kw) for pc in site_chargers
+        ]
+        return min(class_rates) if class_rates else vehicle_max_rate_kw
+
+    def _model_effective_charge_rate_kw(
+        self,
+        model,
+        v_idx: int,
+        vehicle_max_rate_kw: float,
+        site_chargers: Optional[List[ChargerPowerClass]],
+        power_class_choice: Optional[List],
+    ):
+        """Model expression min(p̄_v, P̄_{k_v}) — eq:charge-rate-class (time-slot parity)."""
+        if (
+            not site_chargers
+            or not self.config.enable_charger_allocation
+            or power_class_choice is None
+        ):
+            return vehicle_max_rate_kw
+        return model.sum([
+            model.iif(
+                power_class_choice[v_idx] == pc_idx,
+                min(vehicle_max_rate_kw, pc.max_power_kw),
+                0.0,
+            )
+            for pc_idx, pc in enumerate(site_chargers)
+        ])
+
+    def _validate_site_capacity_vs_chargers(
+        self,
+        site_chargers: Optional[List[ChargerPowerClass]],
+    ) -> None:
+        """Warn when Σ N_k·P_k exceeds contracted site capacity (nameplate vs contract)."""
+        site_capacity_kw = self.config.site_capacity_kw
+        if site_capacity_kw <= 0 or not site_chargers:
+            return
+        nameplate_kw = sum(pc.count * pc.max_power_kw for pc in site_chargers)
+        if nameplate_kw > site_capacity_kw:
+            logger.warning(
+                "[UNIFIED] Sum of charger nameplate capacity (%.1f kW = Σ N_k·P_k) exceeds "
+                "site_capacity_kw (%.1f kW); per-slot site capacity constraints cap aggregate draw.",
+                nameplate_kw,
+                site_capacity_kw,
+            )
+
     def _build_fixed_slot_intervals(self, model, n_slots: int, slot_minutes: int = 30) -> List:
         """Fixed 30-minute slot intervals for overlap-based energy costing."""
         slot_intervals = []
@@ -486,6 +574,8 @@ class UnifiedOptimizer:
         time_slots: List[datetime],
         price_data: Dict[datetime, Tuple[float, bool]],
         slot_intervals: List,
+        site_chargers: Optional[List[ChargerPowerClass]] = None,
+        power_class_choice: Optional[List] = None,
     ) -> List:
         """Slot-aware charging cost for interval sessions (price + synthetic + TRIAD)."""
         n_slots = len(time_slots)
@@ -494,10 +584,14 @@ class UnifiedOptimizer:
             state = vehicle_states.get(vehicle.vehicle_id)
             if not state or state.ac_charge_rate_kw <= 0:
                 continue
-            charge_rate_kw = state.ac_charge_rate_kw
+            charge_rate_kw = self._model_effective_charge_rate_kw(
+                model, v_idx, state.ac_charge_rate_kw,
+                site_chargers, power_class_choice,
+            )
             for t_idx, slot_time in enumerate(time_slots):
                 slot_cost = self._slot_unit_cost(t_idx, n_slots, slot_time, price_data)
                 overlap_minutes = model.overlap_length(charging_sessions[v_idx], slot_intervals[t_idx])
+                # eq:overlap-energy with min(p̄_v, P̄_{k_v})
                 energy_in_slot = (charge_rate_kw / 60.0) * overlap_minutes
                 cost_terms.append(slot_cost * energy_in_slot)
         return cost_terms
@@ -522,7 +616,11 @@ class UnifiedOptimizer:
         vehicle_states: Dict[int, VehicleChargeState],
         final_energy_by_vehicle: List,
     ) -> List:
-        """Soft penalty for kWh shortfall from target SOC at end of planning horizon."""
+        """Soft penalty for kWh shortfall from target SOC (time-slot model only).
+
+        The interval model uses eq:hard-target instead; σ_v^fin would always be zero
+        at optimality when the hard constraint is active.
+        """
         shortfall_terms = []
         penalty = self.config.target_soc_shortfall_penalty
         for v_idx, vehicle in enumerate(vehicles):
@@ -590,7 +688,7 @@ class UnifiedOptimizer:
         vehicle_states: Dict[int, VehicleChargeState],
         energy_by_vehicle: List,
     ) -> None:
-        """Hard constraint: deliver enough energy to reach target SOC when below target."""
+        """eq:hard-target — E_v ≥ Δs_v^tgt when below target SOC."""
         for v_idx, vehicle in enumerate(vehicles):
             state = vehicle_states.get(vehicle.vehicle_id)
             if not state:
@@ -717,6 +815,7 @@ class UnifiedOptimizer:
             )
             
             vehicle_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
+            self._validate_site_capacity_vs_chargers(site_chargers)
             
             # Calculate planning horizon in minutes
             planning_horizon_minutes = n_slots * 30
@@ -740,11 +839,14 @@ class UnifiedOptimizer:
                 
                 # Calculate energy bounds
                 max_energy_needed = max(0.0, state.battery_capacity_kwh - state.current_soc_kwh)
-                charge_rate_kw = state.ac_charge_rate_kw
+                vehicle_rate_kw = state.ac_charge_rate_kw
+                min_rate_kw = self._min_possible_charge_rate_kw(
+                    vehicle_rate_kw, site_chargers,
+                )
                 
-                # Calculate max duration (energy needed / charge rate) in minutes
-                if max_energy_needed > 0 and charge_rate_kw > 0:
-                    max_duration_minutes = int((max_energy_needed / charge_rate_kw) * 60)
+                # Max duration uses slowest possible class (eq:energy-duration bound)
+                if max_energy_needed > 0 and min_rate_kw > 0:
+                    max_duration_minutes = int((max_energy_needed / min_rate_kw) * 60)
                 else:
                     max_duration_minutes = 0
                 
@@ -754,24 +856,27 @@ class UnifiedOptimizer:
                 session.duration_max = max_duration_minutes
                 charging_sessions.append(session)
                 
-                # Energy charged = charge_rate * (duration / 60)
-                # We model this as: energy_charged[v] <= charge_rate * length(session) / 60
-                energy = model.float(0, max_energy_needed)
-                if charge_rate_kw > 0:
-                    model.constraint(
-                        energy == (charge_rate_kw / 60.0) * model.length(session)
-                    )
-                else:
-                    model.constraint(energy == 0)
-                energy_charged.append(energy)
-                
-                # Power class choice (integer variable)
+                # Power class choice (integer variable) — before energy coupling
                 if site_chargers and self.config.enable_charger_allocation:
                     n_charger_classes = len(site_chargers)
                     choice = model.int(0, n_charger_classes - 1)
                     power_class_choice.append(choice)
                 else:
                     power_class_choice.append(model.int(0, 0))
+                
+                # eq:energy-duration — E_v = min(p̄_v, P̄_{k_v}) / 60 · ℓ_v
+                energy = model.float(0, max_energy_needed)
+                if vehicle_rate_kw > 0:
+                    effective_rate_kw = self._model_effective_charge_rate_kw(
+                        model, v_idx, vehicle_rate_kw,
+                        site_chargers, power_class_choice,
+                    )
+                    model.constraint(
+                        energy == (effective_rate_kw / 60.0) * model.length(session)
+                    )
+                else:
+                    model.constraint(energy == 0)
+                energy_charged.append(energy)
             
             if site_chargers and self.config.enable_charger_allocation:
                 n_charger_classes = len(site_chargers)
@@ -784,17 +889,13 @@ class UnifiedOptimizer:
             cost_terms = self._build_interval_charging_cost_terms(
                 model, charging_sessions, vehicles, vehicle_states,
                 time_slots, price_data, slot_intervals,
-            )
-            shortfall_terms = self._build_final_target_soc_shortfall_terms(
-                model, vehicles, vehicle_states, energy_charged,
+                site_chargers, power_class_choice,
             )
             timing_terms = self._build_interval_start_penalty_terms(
                 model, charging_sessions, n_vehicles, planning_horizon_minutes,
             )
             
             objective = model.sum(cost_terms) if cost_terms else model.float(0, 0)
-            if shortfall_terms:
-                objective = objective + model.sum(shortfall_terms)
             if timing_terms:
                 objective = objective + model.sum(timing_terms)
             
@@ -879,6 +980,7 @@ class UnifiedOptimizer:
             )
             
             vehicle_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
+            self._validate_site_capacity_vs_chargers(site_chargers)
             
             # ===== ALLOCATION VARIABLES =====
             sequence_vars = [model.bool() for _ in range(n_sequences)]
@@ -934,37 +1036,41 @@ class UnifiedOptimizer:
                 
                 # Calculate energy bounds
                 max_energy_needed = max(0.0, state.battery_capacity_kwh - state.current_soc_kwh)
-                charge_rate_kw = state.ac_charge_rate_kw
+                vehicle_rate_kw = state.ac_charge_rate_kw
+                min_rate_kw = self._min_possible_charge_rate_kw(
+                    vehicle_rate_kw, site_chargers,
+                )
                 
-                # Calculate max duration (energy needed / charge rate) in minutes
-                if max_energy_needed > 0 and charge_rate_kw > 0:
-                    max_duration_minutes = int((max_energy_needed / charge_rate_kw) * 60)
+                if max_energy_needed > 0 and min_rate_kw > 0:
+                    max_duration_minutes = int((max_energy_needed / min_rate_kw) * 60)
                 else:
                     max_duration_minutes = 0
                 
-                # Create interval variable for charging session (optional)
                 session = model.interval_var(0, planning_horizon_minutes)
-                session.duration_min = 0  # Optional charging
+                session.duration_min = 0
                 session.duration_max = max_duration_minutes
                 charging_sessions.append(session)
                 
-                # Energy charged = charge_rate * (duration / 60)
-                energy = model.float(0, max_energy_needed)
-                if charge_rate_kw > 0:
-                    model.constraint(
-                        energy == (charge_rate_kw / 60.0) * model.length(session)
-                    )
-                else:
-                    model.constraint(energy == 0)
-                energy_charged.append(energy)
-                
-                # Power class choice (integer variable)
                 if site_chargers and self.config.enable_charger_allocation:
                     n_charger_classes = len(site_chargers)
                     choice = model.int(0, n_charger_classes - 1)
                     power_class_choice.append(choice)
                 else:
                     power_class_choice.append(model.int(0, 0))
+                
+                # eq:energy-duration — E_v = min(p̄_v, P̄_{k_v}) / 60 · ℓ_v
+                energy = model.float(0, max_energy_needed)
+                if vehicle_rate_kw > 0:
+                    effective_rate_kw = self._model_effective_charge_rate_kw(
+                        model, v_idx, vehicle_rate_kw,
+                        site_chargers, power_class_choice,
+                    )
+                    model.constraint(
+                        energy == (effective_rate_kw / 60.0) * model.length(session)
+                    )
+                else:
+                    model.constraint(energy == 0)
+                energy_charged.append(energy)
             
             if site_chargers and self.config.enable_charger_allocation:
                 n_charger_classes = len(site_chargers)
@@ -1045,17 +1151,13 @@ class UnifiedOptimizer:
             cost_terms = self._build_interval_charging_cost_terms(
                 model, charging_sessions, vehicles, vehicle_states,
                 time_slots, price_data, slot_intervals,
-            )
-            shortfall_terms = self._build_final_target_soc_shortfall_terms(
-                model, vehicles, vehicle_states, energy_charged,
+                site_chargers, power_class_choice,
             )
             timing_terms = self._build_interval_start_penalty_terms(
                 model, charging_sessions, n_vehicles, planning_horizon_minutes,
             )
             
             scheduling_term = model.sum(cost_terms) if cost_terms else model.float(0, 0)
-            if shortfall_terms:
-                scheduling_term = scheduling_term + model.sum(shortfall_terms)
             if timing_terms:
                 scheduling_term = scheduling_term + model.sum(timing_terms)
             
@@ -1147,6 +1249,7 @@ class UnifiedOptimizer:
             )
             
             vehicle_to_idx = {v.vehicle_id: idx for idx, v in enumerate(vehicles)}
+            self._validate_site_capacity_vs_chargers(site_chargers)
             
             # Bounds helpers
             def _max_charge_kw(v_idx: int) -> float:
@@ -1453,7 +1556,7 @@ class UnifiedOptimizer:
         n_slots = len(time_slots)
         n_vehicles = len(vehicles)
         
-        # 1. Cumulative Energy Calculation
+        # eq:cumulative-energy — u_{t,v} dynamics (time-slot)
         for v_idx, vehicle in enumerate(vehicles):
             state = vehicle_states.get(vehicle.vehicle_id)
             if not state:
@@ -1470,7 +1573,7 @@ class UnifiedOptimizer:
                         cumulative_energy[t_idx - 1][v_idx] + charge_power[t_idx][v_idx] * 0.5
                     )
         
-        # 2. Route Energy Requirements (hard constraint)
+        # eq:route-energy-timeslot — u_{t_p-1,v} ≥ ρ_{v,p}
         for vehicle in vehicles:
             v_idx = vehicle_to_idx.get(vehicle.vehicle_id)
             if v_idx is None:
@@ -1500,7 +1603,7 @@ class UnifiedOptimizer:
                         cumulative_energy[checkpoint_idx - 1][v_idx] >= required_energy
                     )
         
-        # 3. Site Capacity Constraint
+        # eq:site-capacity — Σ_v p_{t,v} ≤ max(0, C − d_t)
         site_capacity_kw = self.config.site_capacity_kw
         for t_idx, slot_time in enumerate(time_slots):
             site_demand_kw = forecast_data.get(slot_time, 0.0) if forecast_data else 0.0
@@ -1510,7 +1613,7 @@ class UnifiedOptimizer:
                 total_charging = model.sum(charge_power[t_idx])
                 model.constraint(total_charging <= available_capacity)
         
-        # 4. Maximum SOC (can't charge beyond battery capacity)
+        # eq:battery-ceiling — u_{t,v} ≤ E_v^max
         for v_idx, vehicle in enumerate(vehicles):
             state = vehicle_states.get(vehicle.vehicle_id)
             if not state:
@@ -1521,7 +1624,7 @@ class UnifiedOptimizer:
             for t_idx in range(n_slots):
                 model.constraint(cumulative_energy[t_idx][v_idx] <= max_energy_kwh)
         
-        # 5. Charge Rate Limits
+        # eq:charge-rate — p_{t,v} ≤ p̄_v (class cap applied below when allocation enabled)
         for v_idx, vehicle in enumerate(vehicles):
             state = vehicle_states.get(vehicle.vehicle_id)
             if not state:
@@ -1532,7 +1635,7 @@ class UnifiedOptimizer:
             for t_idx in range(n_slots):
                 model.constraint(charge_power[t_idx][v_idx] <= max_charge_rate)
         
-        # 6. Vehicle Availability
+        # eq:availability — p_{t,v} = 0 when a_{v,t} = 0
         for v_idx, vehicle in enumerate(vehicles):
             availability = availability_matrices.get(vehicle.vehicle_id)
             if not availability:
@@ -1588,8 +1691,7 @@ class UnifiedOptimizer:
             for v_idx in range(n_vehicles):
                 model.constraint(model.sum(charger_assigned[v_idx]) == 1)
             
-            # 9. Charger Capacity Constraint
-            # Link charge_power[t][v] to assigned power class's max_power
+            # eq:charge-rate-class — p_{t,v} ≤ min(p̄_v, P̄_k) via assigned class
             for t_idx in range(n_slots):
                 for v_idx in range(n_vehicles):
                     # Sum over all power classes: charge_power <= sum of (class_max * assigned_flag)
@@ -1633,9 +1735,8 @@ class UnifiedOptimizer:
             if nighttime_continuity_count > 0:
                 logger.info(f"[UNIFIED] Applied nighttime charger continuity constraint to {nighttime_continuity_count} vehicles")
             
-            # 11. Time-Slot Charger Capacity Constraint
-            # At each time slot, number of vehicles assigned to a power class that are available
-            # (could potentially be connected/charging) cannot exceed the count of chargers in that power class
+            # eq:charger-count-timeslot — plug-in reservation: counts available
+            # vehicles assigned to class k (not only those with p_{t,v} > 0)
             logger.info(f"[UNIFIED] Adding time-slot charger count capacity constraints:")
             for pc_idx in range(n_charger_classes):
                 power_class = site_chargers[pc_idx]
@@ -1687,9 +1788,11 @@ class UnifiedOptimizer:
     ):
         """Add interval-based scheduling constraints to model."""
         n_vehicles = len(vehicles)
+        n_slots = len(time_slots)
         
-        # 1. Route Energy Requirements (hard constraint)
-        # Charging must provide sufficient energy before route starts
+        # eq:route-energy-interval — single session must finish before each checkpoint
+        # LIMITATION: one charging interval per vehicle forces all ρ_{v,p} to be met
+        # before the earliest departure; inter-leg charging is not modeled (see .tex §5).
         planning_start = time_slots[0] if time_slots else datetime.now()
         for vehicle in vehicles:
             v_idx = vehicle_to_idx.get(vehicle.vehicle_id)
@@ -1716,16 +1819,13 @@ class UnifiedOptimizer:
                 )
                 
                 if required_energy > 0:
-                    # Charging must finish before route starts
                     model.constraint(model.end(charging_sessions[v_idx]) <= route_start_minutes)
-                    # Must charge enough energy
                     model.constraint(energy_charged[v_idx] >= required_energy)
         
-        # 2. Maximum SOC (can't charge beyond battery capacity)
-        # Already handled in energy_charged variable bounds
+        # eq:hard-target — E_v upper bound via energy_charged variable domain
         
-        # 3. Vehicle Availability Windows
-        # Convert availability matrix to interval time bounds
+        # eq:availability-envelope — contiguous first-to-last available slot span
+        # (per-slot gaps inside the envelope are not forbidden; see post-solve validation)
         for v_idx, vehicle in enumerate(vehicles):
             availability = availability_matrices.get(vehicle.vehicle_id)
             if not availability:
@@ -1753,7 +1853,31 @@ class UnifiedOptimizer:
                 model.constraint(model.start(charging_sessions[v_idx]) >= earliest_start)
                 model.constraint(model.end(charging_sessions[v_idx]) <= latest_end)
         
-        # 4. Charger Power Class Constraints
+        # eq:site-capacity-interval — Σ_v p̄_{v,t} ≤ max(0, C − d_t) per 30-min bucket
+        site_capacity_kw = self.config.site_capacity_kw
+        if site_capacity_kw > 0 and n_slots > 0:
+            slot_intervals = self._build_fixed_slot_intervals(model, n_slots)
+            for t_idx, slot_time in enumerate(time_slots):
+                site_demand_kw = forecast_data.get(slot_time, 0.0) if forecast_data else 0.0
+                available_capacity = max(0.0, site_capacity_kw - site_demand_kw)
+                slot_power_terms = []
+                for v_idx, vehicle in enumerate(vehicles):
+                    state = vehicle_states.get(vehicle.vehicle_id)
+                    if not state or state.ac_charge_rate_kw <= 0:
+                        continue
+                    eff_rate_kw = self._model_effective_charge_rate_kw(
+                        model, v_idx, state.ac_charge_rate_kw,
+                        site_chargers, power_class_choice,
+                    )
+                    overlap_min = model.overlap_length(
+                        charging_sessions[v_idx], slot_intervals[t_idx],
+                    )
+                    # Average slot power (kW), consistent with eq:overlap-energy
+                    slot_power_terms.append(eff_rate_kw * overlap_min / 30.0)
+                if slot_power_terms:
+                    model.constraint(model.sum(slot_power_terms) <= available_capacity)
+        
+        # Charger class assignment (optional) — eq:charger-class-interval
         if site_chargers and power_class_choice and self.config.enable_charger_allocation:
             n_charger_classes = len(site_chargers)
             total_chargers = sum(pc.count for pc in site_chargers)
@@ -1807,30 +1931,7 @@ class UnifiedOptimizer:
             if nighttime_continuity_count > 0:
                 logger.info(f"[UNIFIED] Applied nighttime charger continuity constraint to {nighttime_continuity_count} vehicles")
             
-            # 4c. Charger Power Limit based on assigned power class
-            for v_idx, vehicle in enumerate(vehicles):
-                state = vehicle_states.get(vehicle.vehicle_id)
-                if not state:
-                    continue
-                
-                vehicle_max_rate = state.ac_charge_rate_kw
-                
-                # Effective charge rate = min(vehicle_rate, charger_power[choice])
-                # We enforce this through the energy constraint
-                # energy_charged = (effective_rate / 60) * length(session)
-                # Since we already set energy = (vehicle_rate / 60) * length, we need to add:
-                # energy <= (charger_power[choice] / 60) * length
-                
-                for pc_idx in range(n_charger_classes):
-                    charger_power = site_chargers[pc_idx].max_power_kw
-                    effective_rate = min(vehicle_max_rate, charger_power)
-                    
-                    # If this power class is chosen, enforce the limit
-                    # This is tricky - we need conditional constraints
-                    # For now, we'll enforce it differently: adjust the energy constraint
-                    pass  # Will be enforced through energy limits
-            
-            # 4d. Cumulative Charger Capacity Constraint using m.pulse()
+            # eq:charger-pulse — Σ_v pulse(I_v, 𝟙[k_v=k]) ≤ N_k (plug-in semantics while charging)
             logger.info(f"[UNIFIED] Adding cumulative charger capacity constraints")
             for pc_idx, power_class in enumerate(site_chargers):
                 usage_pulses = []
@@ -2037,6 +2138,36 @@ class UnifiedOptimizer:
             if slot_time >= target_time:
                 return idx
         return None
+
+    def _log_interval_availability_violation(
+        self,
+        vehicle_id: int,
+        start_minutes: int,
+        end_minutes: int,
+        availability: VehicleAvailability,
+        time_slots: List[datetime],
+    ) -> bool:
+        """Post-solve check: session must not overlap unavailable slots inside envelope."""
+        if end_minutes <= start_minutes:
+            return False
+        violated = False
+        for t_idx, is_available in enumerate(availability.availability_matrix):
+            if is_available:
+                continue
+            slot_start = t_idx * 30
+            slot_end = (t_idx + 1) * 30
+            if start_minutes < slot_end and end_minutes > slot_start:
+                slot_label = (
+                    time_slots[t_idx].isoformat()
+                    if t_idx < len(time_slots) else str(t_idx)
+                )
+                logger.warning(
+                    "[UNIFIED] Availability envelope violation: vehicle %s session "
+                    "[%d, %d) min overlaps unavailable slot %d (%s)",
+                    vehicle_id, start_minutes, end_minutes, t_idx, slot_label,
+                )
+                violated = True
+        return violated
     
     def _extract_interval_solution(
         self,
@@ -2125,6 +2256,13 @@ class UnifiedOptimizer:
             
             start_dt = planning_start + timedelta(minutes=start_minutes)
             end_dt = planning_start + timedelta(minutes=end_minutes)
+            
+            availability = availability_matrices.get(vehicle.vehicle_id)
+            if availability:
+                self._log_interval_availability_violation(
+                    vehicle.vehicle_id, start_minutes, end_minutes,
+                    availability, time_slots,
+                )
             
             # Determine assigned charger
             assigned_charger_id = state.charger_id

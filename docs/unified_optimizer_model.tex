@@ -1,0 +1,535 @@
+% Unified Optimizer — Complete Mathematical Model
+% Source of truth: src/optimizer/unified_optimizer.py
+%                  src/optimizer/cost_matrix.py
+%                  src/constraints/*.py
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{array}
+\usepackage{longtable}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{Unified Vehicle Allocation and Charge Scheduling Optimizer\\[0.4em]
+\large Complete Mathematical Model}
+\author{allocation-v2 codebase}
+\date{\today}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\1}{\mathbf{1}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document formalises the mixed-integer optimisation model implemented in the
+\texttt{UnifiedOptimizer} (Hexaly). The system supports three operational modes:
+\textbf{allocation-only}, \textbf{scheduling-only} (with pre-allocated routes), and
+\textbf{integrated} (joint allocation and charging). Scheduling is solved primarily with
+\textbf{interval variables} (one optional charging session per vehicle); a
+\textbf{time-slot} formulation is used as fallback when interval support is unavailable.
+Sequence scores for allocation are pre-computed by a constraint manager before the
+solver is invoked.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{Overview and Solver Architecture}
+%==============================================================================
+
+The unified optimizer solves a weighted-sum problem:
+\begin{equation}
+  \label{eq:integrated-objective}
+  \max \;\; \alpha \cdot A(x) \;-\; \beta \cdot S(y),
+\end{equation}
+where $A(x)$ is the allocation score, $S(y)$ is the scheduling cost (including SOC
+shortfall and timing penalties), $\alpha = \texttt{allocation\_score\_weight}$, and
+$\beta = \texttt{scheduling\_cost\_weight}$.
+
+\begin{itemize}[nosep]
+  \item \textbf{Allocation-only:} maximise $A(x)$ subject to allocation constraints.
+  \item \textbf{Scheduling-only:} minimise $S(y)$ subject to scheduling constraints
+        (routes fixed via \texttt{fix\_allocation}).
+  \item \textbf{Integrated:} maximise~\eqref{eq:integrated-objective} over $(x,y)$.
+\end{itemize}
+
+The implementation selects interval-based scheduling when Hexaly exposes
+\texttt{interval\_var}; otherwise the time-slot model is used. Both variants share
+pricing parameters ($\gamma_t$, $\sigma$, $\tau$) but differ in decision variables
+and enforcement: the interval model adds an early-start penalty ($\mu$) and now
+enforces per-slot site capacity via overlap-based average power; the time-slot model
+uses per-slot SOC shortfall ($\lambda\sigma_{t,v}$) instead of interval-only final
+shortfall, and reserves charger slots for all available assigned vehicles (plug-in
+semantics).
+
+%==============================================================================
+\section{Sets, Indices, and Input Data}
+%==============================================================================
+
+\subsection{Index sets}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Description \\
+\midrule
+$V = \{1,\ldots,n_v\}$ & Vehicles (site fleet) \\
+$R = \{1,\ldots,n_r\}$ & Routes in planning/allocation window \\
+$S = \{1,\ldots,n_s\}$ & Feasible route \emph{sequences} (pre-generated) \\
+$T = \{0,\ldots,n_t-1\}$ & Discrete 30-minute time slots \\
+$K = \{0,\ldots,n_k-1\}$ & Charger power classes at the site \\
+$P_v \subseteq R$ & Route checkpoints for vehicle $v$ (ordered by departure) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each sequence $s \in S$ is a tuple $(v(s), \mathcal{R}_s, c_s)$ where $v(s) \in V$ is
+the assigned vehicle, $\mathcal{R}_s = (r_1,\ldots,r_{|\mathcal{R}_s|})$ is an ordered
+route subsequence, and $c_s \in \R$ is the pre-computed sequence score.
+
+\subsection{Static parameters}
+
+\begin{center}
+\begin{longtable}{@{}p{3.2cm}p{10cm}@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+\endhead
+$W_{\mathrm{route}}$ & \texttt{route\_count\_weight} (default $10^2$): priority on covering routes \\
+$\alpha$ & \texttt{allocation\_score\_weight} \\
+$\beta$ & \texttt{scheduling\_cost\_weight} \\
+$\lambda$ & \texttt{target\_soc\_shortfall\_penalty} (£ per kWh shortfall) \\
+$\sigma$ & \texttt{synthetic\_time\_price\_factor} (early-charge bias) \\
+$\tau$ & \texttt{triad\_penalty\_factor} (£ per kWh during TRIAD slots) \\
+$\mu$ & \texttt{makespan\_penalty\_weight} (interval start-time penalty scale) \\
+$\theta_v$ & Target SOC for vehicle $v$ (\%, converted to kWh) \\
+$\Delta = 0.5$ & Slot duration (hours); each slot is 30 minutes \\
+$H$ & Planning horizon in minutes ($H = 30\,n_t$) \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\subsection{Vehicle and site data}
+
+For each vehicle $v \in V$:
+\begin{itemize}[nosep]
+  \item $B_v$ --- battery capacity (kWh)
+  \item $s_v^0$ --- current SOC (kWh) at planning start
+  \item $\bar{s}_v = (\theta_v/100)\,B_v$ --- target SOC (kWh)
+  \item $\Delta s_v^{\mathrm{tgt}} = \max(0,\,\bar{s}_v - s_v^0)$ --- energy needed to reach target
+  \item $\bar{p}_v$ --- AC charge rate limit (kW)
+  \item $E_v^{\max} = B_v - s_v^0$ --- maximum deliverable energy
+  \item $a_{v,t} \in \{0,1\}$ --- availability (1 = vehicle can charge in slot $t$)
+\end{itemize}
+
+For each slot $t \in T$:
+\begin{itemize}[nosep]
+  \item $\pi_t$ --- electricity price (£/kWh)
+  \item $\delta_t \in \{0,1\}$ --- TRIAD indicator
+  \item $d_t$ --- forecasted non-EV site demand (kW)
+  \item $C = \texttt{site\_capacity\_kw}$ --- agreed site capacity (kW)
+\end{itemize}
+
+Slot unit cost (used in both scheduling formulations):
+\begin{equation}
+  \label{eq:slot-cost}
+  \gamma_t = \pi_t \;+\; \sigma\,\frac{n_t - t}{n_t} \;+\; \tau\,\delta_t.
+\end{equation}
+
+For each route checkpoint $p \in P_v$ at slot index $t_p$:
+\begin{itemize}[nosep]
+  \item $e_p$ --- cumulative route energy requirement at departure (kWh)
+  \item Required delivered energy before departure:
+        $\rho_{v,p} = \max(0,\, e_p - s_v^0)$
+\end{itemize}
+
+For each charger class $k \in K$:
+\begin{itemize}[nosep]
+  \item $N_k$ --- number of physical chargers in class $k$
+  \item $\bar{P}_k$ --- maximum power (kW) of class $k$
+\end{itemize}
+
+%==============================================================================
+\section{Pre-processing: Sequence Generation and Scores}
+%==============================================================================
+
+Before the Hexaly model is built, \texttt{CostMatrixBuilder} enumerates feasible
+route sequences per vehicle. For vehicle $v$, all subsets of routes of length
+$1,\ldots,L_v$ are considered (combinatorial generation with overlap pruning).
+
+\subsection{Hard feasibility (sequence filter)}
+
+A sequence $\mathcal{R} = (r_1,\ldots,r_m)$ for vehicle $v$ is \textbf{discarded} if any
+\emph{hard} MAF constraint evaluates to a negative penalty. Hard constraints include:
+\begin{itemize}[nosep]
+  \item \textbf{Energy feasibility} --- sufficient battery energy for the route sequence
+  \item \textbf{Strict turnaround} --- consecutive routes do not overlap in time
+        (modulo configured turnaround minutes)
+  \item \textbf{Strict shift hours} --- routes fall within driver shift windows
+\end{itemize}
+
+Non-overlapping route pairs are also pre-filtered during sequence generation using
+turnaround-aware overlap checks.
+
+\subsection{Soft sequence score}
+
+For each feasible sequence $\mathcal{R}$ assigned to vehicle $v$, the score is:
+\begin{equation}
+  \label{eq:sequence-score}
+  c_{v,\mathcal{R}} = \sum_{j \in \mathcal{J}} \mathrm{cost}_j(v, \mathcal{R}),
+\end{equation}
+where $\mathcal{J}$ is the set of enabled soft constraints (e.g.\ preferred turnaround,
+charger preference bonuses/penalties). Hard-constraint violations yield
+$c = -\infty$ (sequence excluded).
+
+Each surviving sequence becomes one index $s \in S$ with score $c_s = c_{v(s),\mathcal{R}_s}$.
+
+%==============================================================================
+\section{Allocation Sub-model}
+%==============================================================================
+
+\subsection{Decision variables}
+
+\begin{align}
+  x_s &\in \{0,1\} && \text{1 if sequence $s$ is selected} \\
+  y_r &\in \{0,1\} && \text{1 if route $r$ is covered (auxiliary)}
+\end{align}
+
+\subsection{Objective (allocation-only)}
+
+\begin{equation}
+  \label{eq:alloc-obj}
+  \max \;\; W_{\mathrm{route}} \sum_{r \in R} y_r \;+\; \sum_{s \in S} c_s\, x_s.
+\end{equation}
+
+\subsection{Constraints}
+
+\paragraph{At most one sequence per vehicle.}
+Let $S_v = \{s \in S : v(s) = v\}$.
+\begin{equation}
+  \sum_{s \in S_v} x_s \;\le\; 1 \qquad \forall v \in V.
+\end{equation}
+
+\paragraph{Route coverage linking.}
+For each route $r \in R$, let $S(r) = \{s \in S : r \in \mathcal{R}_s\}$.
+\begin{align}
+  \sum_{s \in S(r)} x_s &\;\le\; 1 && \forall r \in R, \\
+  y_r &\;\le\; \sum_{s \in S(r)} x_s && \forall r \in R, \\
+  \sum_{s \in S(r)} x_s &\;\le\; |S(r)|\, y_r && \forall r \in R.
+\end{align}
+
+The first inequality ensures no route is allocated twice; the linking constraints
+define $y_r = \1[\sum_{s \in S(r)} x_s \ge 1]$.
+
+%==============================================================================
+\section{Scheduling Sub-model}
+%==============================================================================
+
+Two equivalent scheduling economics are implemented; the solver uses one formulation
+depending on Hexaly capabilities.
+
+%------------------------------------------------------------------------------
+\subsection{Formulation A: Interval Model (Primary)}
+%------------------------------------------------------------------------------
+
+Each vehicle $v$ has one optional charging session represented by an interval variable.
+
+\subsubsection{Decision variables}
+
+\begin{align}
+  I_v &= [\mathrm{start}_v,\;\mathrm{end}_v) && \text{charging session interval (minutes)} \\
+  \ell_v &= \mathrm{end}_v - \mathrm{start}_v && \text{session duration (minutes)} \\
+  E_v &\in [0,\, E_v^{\max}] && \text{total energy delivered (kWh)} \\
+  k_v &\in K && \text{charger power class (if allocation enabled)}
+\end{align}
+
+Optional sessions satisfy $0 \le \ell_v \le \ell_v^{\max}$ where
+$\ell_v^{\max} = \lfloor 60\, E_v^{\max} / \bar{p}_v \rfloor$.
+
+Energy-duration coupling at effective charge rate $\min(\bar{p}_v, \bar{P}_{k_v})$:
+\begin{equation}
+  \label{eq:energy-duration}
+  E_v = \frac{\min(\bar{p}_v, \bar{P}_{k_v})}{60}\,\ell_v.
+\end{equation}
+When charger allocation is disabled, $\bar{P}_{k_v}$ is omitted and $\bar{p}_v$ alone
+is used.
+
+Fixed slot intervals for costing: for each $t \in T$,
+$J_t = [30t,\, 30(t+1))$ (minutes).
+
+Overlap energy in slot $t$:
+\begin{equation}
+  \label{eq:overlap-energy}
+  e_{v,t} = \frac{\min(\bar{p}_v, \bar{P}_{k_v})}{60}\,\mathrm{overlap\_length}(I_v, J_t).
+\end{equation}
+
+\subsubsection{Scheduling objective (scheduling-only)}
+
+Minimise:
+\begin{equation}
+  \label{eq:sched-interval-obj}
+  \underbrace{\sum_{v \in V}\sum_{t \in T} \gamma_t\, e_{v,t}}_{\text{slot-aware charging cost}}
+  \;+\;
+  \underbrace{\frac{\mu}{H}\sum_{v \in V} \mathrm{start}_v}_{\text{early-start penalty}},
+\end{equation}
+The interval path uses hard target SOC (eq:hard-target) rather than a final
+shortfall term; $\sigma_v^{\mathrm{fin}}$ is omitted because it would be zero at
+optimality whenever the hard constraint is active.
+\begin{equation}
+  \label{eq:hard-target}
+  E_v \;\ge\; \Delta s_v^{\mathrm{tgt}} \qquad \forall v \text{ with } \Delta s_v^{\mathrm{tgt}} > 0.
+\end{equation}
+
+\subsubsection{Scheduling constraints (interval)}
+
+\paragraph{Route energy (hard).}
+For each checkpoint $p \in P_v$ with departure at minute $m_p$ and requirement $\rho_{v,p} > 0$:
+\begin{align}
+  \mathrm{end}_v &\;\le\; m_p, \\
+  E_v &\;\ge\; \rho_{v,p}.
+\end{align}
+\emph{Expressiveness note:} with a single optional charging interval per vehicle,
+all $\rho_{v,p}$ must be satisfied before the \textbf{earliest} relevant departure;
+inter-leg charging between multiple route legs is not modeled.
+
+\paragraph{Site capacity (interval).}
+Per slot $t$ with available capacity $C - d_t$:
+\begin{equation}
+  \label{eq:site-capacity-interval}
+  \sum_{v \in V} \frac{\min(\bar{p}_v, \bar{P}_{k_v})}{30}\,
+  \mathrm{overlap\_length}(I_v, J_t)
+  \;\le\; \max(0,\, C - d_t).
+\end{equation}
+Average slot power is used for consistency with eq:overlap-energy. A startup warning
+is logged when $\sum_k N_k \bar{P}_k > C$ (nameplate exceeds contract).
+
+\paragraph{Availability window.}
+Let $t_v^{\mathrm{first}}$ and $t_v^{\mathrm{last}}$ be the first and last available slot
+indices for vehicle $v$. The session must lie within the contiguous available span:
+\begin{align}
+  \mathrm{start}_v &\;\ge\; 30\, t_v^{\mathrm{first}}, \\
+  \mathrm{end}_v &\;\le\; 30\,(t_v^{\mathrm{last}} + 1).
+\end{align}
+
+\paragraph{Integrated mode: route execution intervals.}
+When allocation and scheduling are solved jointly, each selected sequence $s$ induces
+route execution intervals $R_{s,j}$ for $j = 1,\ldots,|\mathcal{R}_s|$. For selected
+sequences:
+\begin{align}
+  \mathrm{present}(R_{s,j}) &\;\Leftrightarrow\; x_s = 1, \\
+  \mathrm{start}(R_{s,j+1}) &\;\ge\; \mathrm{end}(R_{s,j}), \\
+  \mathrm{no\_overlap}(I_{v(s)}, R_{s,j}) &\quad \forall j.
+\end{align}
+
+\paragraph{Charger class assignment (optional).}
+When \texttt{enable\_charger\_allocation} is true:
+\begin{itemize}[nosep]
+  \item Each vehicle selects exactly one class: $k_v \in K$.
+  \item If already connected to a charger, $k_v$ is fixed to that charger's class.
+  \item Nighttime continuity: vehicles that charged overnight on class $k$ must use
+        the same class if charging again during night hours ($19{:}00$--$07{:}00$).
+  \item \textbf{Cumulative capacity} via pulse functions: for each class $k$,
+        \begin{equation}
+          \sum_{v \in V} \mathrm{pulse}\bigl(I_v,\; \1[k_v = k]\bigr) \;\le\; N_k.
+        \end{equation}
+        The pulse is active while vehicle $v$ is charging and assigned to class $k$.
+  \item Effective rate $\min(\bar{p}_v, \bar{P}_{k_v})$ is enforced in
+        eq:energy-duration and eq:overlap-energy (not a separate conditional block).
+\end{itemize}
+
+%------------------------------------------------------------------------------
+\subsection{Formulation B: Time-Slot Model (Fallback)}
+%------------------------------------------------------------------------------
+
+\subsubsection{Decision variables}
+
+\begin{align}
+  p_{t,v} &\in [0,\,\bar{p}_v] && \text{charging power in slot $t$ (kW)} \\
+  u_{t,v} &\in [0,\, E_v^{\max}] && \text{cumulative energy delivered by end of slot $t$ (kWh)} \\
+  z_{v,k} &\in \{0,1\} && \text{1 if vehicle $v$ assigned to charger class $k$}
+\end{align}
+
+\subsubsection{Cumulative energy dynamics}
+
+\begin{equation}
+  u_{t,v} =
+  \begin{cases}
+    \Delta\, p_{0,v} & t = 0, \\[4pt]
+    u_{t-1,v} + \Delta\, p_{t,v} & t > 0.
+  \end{cases}
+\end{equation}
+
+Energy delivered in slot $t$: $e_{t,v} = \Delta\, p_{t,v}$.
+
+\subsubsection{Scheduling objective (time-slot)}
+
+Minimise:
+\begin{equation}
+  \label{eq:sched-timeslot-obj}
+  \sum_{t \in T}\sum_{v \in V} \gamma_t\, e_{t,v}
+  \;+\;
+  \frac{\lambda}{n_t}\sum_{t \in T}\sum_{v \in V} \sigma_{t,v}
+  \;+\;
+  \text{(integrated: } \alpha,\beta \text{ weighting as in \eqref{eq:integrated-objective})},
+\end{equation}
+where per-slot shortfall variables satisfy:
+\begin{align}
+  \sigma_{t,v} &\;\ge\; 0 && \forall t,v, \\
+  \sigma_{t,v} &\;\ge\; \Delta s_v^{\mathrm{tgt}} - u_{t,v} && \forall t,v \text{ with } \Delta s_v^{\mathrm{tgt}} > 0.
+\end{align}
+
+Hard target SOC at horizon end:
+\begin{equation}
+  u_{n_t-1,v} \;\ge\; \Delta s_v^{\mathrm{tgt}} \qquad \forall v \text{ with } \Delta s_v^{\mathrm{tgt}} > 0.
+\end{equation}
+
+\subsubsection{Scheduling constraints (time-slot)}
+
+\paragraph{Route energy (hard).}
+For checkpoint $p$ at slot $t_p$ with $\rho_{v,p} > 0$:
+\begin{equation}
+  u_{t_p - 1,\, v} \;\ge\; \rho_{v,p}.
+\end{equation}
+
+\paragraph{Site capacity.}
+\begin{equation}
+  \sum_{v \in V} p_{t,v} \;\le\; \max(0,\, C - d_t) \qquad \forall t \in T.
+\end{equation}
+
+\paragraph{Battery ceiling.}
+\begin{equation}
+  u_{t,v} \;\le\; E_v^{\max} \qquad \forall t \in T,\; \forall v \in V.
+\end{equation}
+
+\paragraph{Charge rate.}
+\begin{equation}
+  p_{t,v} \;\le\; \bar{p}_v \qquad \forall t,v.
+\end{equation}
+
+\paragraph{Availability.}
+\begin{equation}
+  p_{t,v} = 0 \qquad \forall t \text{ with } a_{v,t} = 0.
+\end{equation}
+
+\paragraph{Charger class assignment (optional).}
+When enabled:
+\begin{align}
+  \sum_{k \in K} z_{v,k} &= 1 && \forall v, \\
+  p_{t,v} &\;\le\; \sum_{k \in K} \min(\bar{p}_v, \bar{P}_k)\, z_{v,k} && \forall t,v, \\
+  \sum_{v:\, a_{v,t}=1} z_{v,k} &\;\le\; N_k && \forall t,k.
+\end{align}
+The charger-count constraint uses \textbf{plug-in reservation}: any available vehicle
+assigned to class $k$ counts against $N_k$, even when $p_{t,v} = 0$ (idle but connected).
+Fixed-class and nighttime-continuity rules mirror the interval formulation.
+
+%==============================================================================
+\section{Integrated Model}
+%==============================================================================
+
+The integrated model combines Section~\ref{eq:alloc-obj} allocation variables and
+constraints with Section~5 scheduling variables and constraints. The objective is
+\begin{equation}
+  \max \;\; \alpha \left( W_{\mathrm{route}} \sum_{r \in R} y_r + \sum_{s \in S} c_s x_s \right)
+  - \beta \left( \text{scheduling cost terms from \eqref{eq:sched-interval-obj} or \eqref{eq:sched-timeslot-obj}} \right).
+\end{equation}
+
+Route execution intervals are linked to sequence selection via
+$\mathrm{present}(R_{s,j}) \Leftrightarrow x_s = 1$, and charging sessions must not
+overlap allocated route intervals for the same vehicle.
+
+%==============================================================================
+\section{Objective Component Summary}
+%==============================================================================
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Component & Interval model & Time-slot model & Role \\
+\midrule
+Electricity cost & $\sum_{v,t} \gamma_t e_{v,t}$ & $\sum_{v,t} \gamma_t \Delta p_{t,v}$ & TOU + TRIAD pricing \\
+Early-charge bias & $\sigma$ in $\gamma_t$; $\mu$ start penalty & $\sigma$ in $\gamma_t$ only & Prefer earlier charging \\
+Site capacity & eq:site-capacity-interval & eq:site-capacity (time-slot) & Cap aggregate draw \\
+SOC shortfall (soft) & --- (hard target only) & $\frac{\lambda}{n_t}\sum_{t,v}\sigma_{t,v}$ & Penalise below-target SOC \\
+SOC target (hard) & $E_v \ge \Delta s_v^{\mathrm{tgt}}$ & $u_{n_t-1,v} \ge \Delta s_v^{\mathrm{tgt}}$ & Require target when feasible \\
+Route energy (hard) & $E_v \ge \rho_{v,p}$, $\mathrm{end}_v \le m_p$ & $u_{t_p-1,v} \ge \rho_{v,p}$ & Feasible departures \\
+Allocation score & $\sum_s c_s x_s + W_{\mathrm{route}}\sum_r y_r$ & (same) & Route assignment quality \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%==============================================================================
+\section{Default Parameter Values}
+%==============================================================================
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Parameter & Config key & Default \\
+\midrule
+$W_{\mathrm{route}}$ & \texttt{route\_count\_weight} & $10^2$ \\
+$\alpha$ & \texttt{allocation\_score\_weight} & $1.0$ \\
+$\beta$ & \texttt{scheduling\_cost\_weight} & $1.0$ \\
+$\lambda$ & \texttt{target\_soc\_shortfall\_penalty} & $2.0$ \\
+$\sigma$ & \texttt{synthetic\_time\_price\_factor} & $0.05$ \\
+$\tau$ & \texttt{triad\_penalty\_factor} & $100.0$ \\
+$\mu$ & \texttt{makespan\_penalty\_weight} & $0.5$ \\
+$\theta_v$ & \texttt{target\_soc\_percent} & $75\%$ config default; $85\%$ via MAF (\texttt{DEFAULT\_TARGET\_SOC\_PERCENT} in \texttt{src/config.py}, resolved in \texttt{get\_scheduler\_params\_from\_site\_config}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%==============================================================================
+\section{Implementation Notes}
+%==============================================================================
+
+\begin{enumerate}[label=\arabic*.]
+  \item \textbf{Solver:} Hexaly Optimizer (\texttt{hexaly.optimizer}). Time limits:
+        30\,s (allocation), 300\,s (scheduling), 330\,s (integrated).
+  \item \textbf{Greedy fallback:} When Hexaly is inactive or the solve throws, a greedy
+        heuristic selects cheapest available slots (by $\gamma_t$) to meet energy needs.
+  \item \textbf{Sequence explosion:} $n_s$ grows combinatorially in $|R|$ and
+        \texttt{max\_routes\_per\_vehicle}; infeasible sequences are filtered before
+        the solver sees them.
+  \item \textbf{Interval availability simplification:} The interval model uses the
+        first-to-last available slot span (contiguous envelope), not individual gaps;
+        the time-slot model respects per-slot availability exactly. Post-solve logging
+        flags sessions that overlap unavailable slots inside the envelope.
+  \item \textbf{Single charging session:} One optional interval per vehicle cannot
+        split energy across inter-leg windows; see route-energy expressiveness note.
+  \item \textbf{Site capacity validation:} If $\sum_k N_k \bar{P}_k > C$, a warning
+        is logged at model build; per-slot constraints still enforce $C - d_t$.
+  \item \textbf{API overrides:} All weights and $\theta_v$ can be overridden per request
+        via \texttt{/optimize/unified}.
+\end{enumerate}
+
+%==============================================================================
+\section{Notation Quick Reference}
+%==============================================================================
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Definition \\
+\midrule
+$x_s$ & Sequence $s$ selected \\
+$y_r$ & Route $r$ covered \\
+$p_{t,v}$ & Charging power (kW) in slot $t$ \\
+$u_{t,v}$ & Cumulative energy delivered (kWh) by end of slot $t$ \\
+$E_v$ & Total energy delivered in interval session (kWh) \\
+$I_v$ & Charging session interval \\
+$\gamma_t$ & Slot unit cost \eqref{eq:slot-cost} \\
+$\Delta s_v^{\mathrm{tgt}}$ & Energy gap to target SOC \\
+$\rho_{v,p}$ & Energy gap to route checkpoint $p$ \\
+$c_s$ & Pre-computed sequence score \eqref{eq:sequence-score} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

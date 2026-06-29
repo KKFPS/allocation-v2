@@ -17,7 +17,6 @@ from src.maf.parameter_parser import (
     get_site_parameter,
     get_all_constraint_configs,
     resolve_site_config,
-    get_scheduler_params_from_site_config,
 )
 from src.constraints.constraint_manager import ConstraintManager
 from src.optimizer.cost_matrix import CostMatrixBuilder
@@ -26,6 +25,7 @@ from src.optimizer.unified_optimizer import (
     UnifiedOptimizationConfig,
     UnifiedOptimizationResult,
     OptimizationMode,
+    default_unified_optimization_config,
     normalize_mode_input,
     resolve_optimization_from_modes,
 )
@@ -33,11 +33,6 @@ from src.config import (
     APPLICATION_NAME, DEFAULT_ALLOCATION_WINDOW_HOURS,
     DEFAULT_MAX_ROUTES_PER_VEHICLE, DEFAULT_RESERVE_VEHICLE_COUNT,
     DEFAULT_TURNAROUND_TIME_MINUTES, DEFAULT_PLANNING_WINDOW_HOURS,
-    DEFAULT_TARGET_SOC_PERCENT,
-    UNIFIED_MAKESPAN_PENALTY_WEIGHT,
-    UNIFIED_SOC_SHORTFALL_PENALTY,
-    UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR,
-    UNIFIED_TRIAD_PENALTY_FACTOR,
 )
 from src.utils.logging_config import logger
 
@@ -836,30 +831,23 @@ class UnifiedController:
         config: UnifiedOptimizationConfig,
         target_soc_percent_override: Optional[float] = None,
     ) -> None:
-        """Apply site-level scheduler MAF parameters to optimization config."""
-        scheduler_params = get_scheduler_params_from_site_config(self.site_config)
+        """Apply per-request overrides. Optimizer weights default from src.config only."""
         if target_soc_percent_override is not None:
             config.target_soc_percent = target_soc_percent_override
-        else:
-            config.target_soc_percent = scheduler_params['target_soc_percent']
         logger.info(
-            f"Scheduler params: target_soc_percent={config.target_soc_percent}, "
+            f"Optimizer config: target_soc_percent={config.target_soc_percent}, "
+            f"allocation_score_weight={config.allocation_score_weight}, "
+            f"scheduling_cost_weight={config.scheduling_cost_weight}, "
+            f"route_count_weight={config.route_count_weight}, "
             f"target_soc_shortfall_penalty={config.target_soc_shortfall_penalty}, "
             f"synthetic_time_price_factor={config.synthetic_time_price_factor}, "
-            f"makespan_penalty_weight={config.makespan_penalty_weight}"
+            f"makespan_penalty_weight={config.makespan_penalty_weight}, "
+            f"triad_penalty_factor={config.triad_penalty_factor}"
         )
 
     def _build_optimization_config(self, mode: OptimizationMode) -> UnifiedOptimizationConfig:
-        """Build optimization configuration from MAF parameters."""
-        scheduler_params = get_scheduler_params_from_site_config(self.site_config)
-        config = UnifiedOptimizationConfig(
-            mode=mode,
-            target_soc_percent=scheduler_params['target_soc_percent'],
-            target_soc_shortfall_penalty=UNIFIED_SOC_SHORTFALL_PENALTY,
-            synthetic_time_price_factor=UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR,
-            triad_penalty_factor=UNIFIED_TRIAD_PENALTY_FACTOR,
-            makespan_penalty_weight=UNIFIED_MAKESPAN_PENALTY_WEIGHT,
-        )
+        """Build optimization configuration from src.config defaults."""
+        config = default_unified_optimization_config(mode)
         
         # Load site capacity for scheduling
         if mode in (OptimizationMode.SCHEDULING_ONLY, OptimizationMode.INTEGRATED):

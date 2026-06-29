@@ -127,18 +127,28 @@ MICROLISE_BLOB_CONN_STRING = os.getenv("storage_account_conn_string", "")
 MICROLISE_BLOB_CONTAINER = os.getenv("allocation_blob_container", "")
 MICROLISE_BLOB_DIR = os.getenv("allocation_blob_dir", "")
 
-# Unified optimizer weights (weighted sum objective)
-# Objective: α * allocation_score - β * scheduling_cost
-UNIFIED_ALLOCATION_WEIGHT = 1.0      # α: weight for allocation term
-UNIFIED_SCHEDULING_WEIGHT = 1.0      # β: weight for scheduling cost term
-UNIFIED_ROUTE_COUNT_WEIGHT = 1e2     # Priority weight for route coverage
-UNIFIED_SOC_SHORTFALL_PENALTY = 2.0  # Penalty per kWh shortfall from target (≥ typical £/kWh)
-UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR = 0.05  # Bias charging toward earlier slots
-UNIFIED_TRIAD_PENALTY_FACTOR = 100.0  # Penalty per kWh charged during TRIAD periods
-UNIFIED_MAKESPAN_PENALTY_WEIGHT = 0.5  # Penalize late charging session starts (interval model)
+# Unified optimizer — single source of truth for UnifiedOptimizationConfig defaults.
+# Objective: α * allocation_score - β * scheduling_cost (+ route coverage via W_route)
+UNIFIED_ALLOCATION_WEIGHT = 2.0       # α: allocation_score_weight
+UNIFIED_SCHEDULING_WEIGHT = 1.0       # β: scheduling_cost_weight
+UNIFIED_ALLOCATION_SCORE_WEIGHT = UNIFIED_ALLOCATION_WEIGHT
+UNIFIED_SCHEDULING_COST_WEIGHT = UNIFIED_SCHEDULING_WEIGHT
+UNIFIED_ROUTE_COUNT_WEIGHT = 1e2      # Priority weight for route coverage
+UNIFIED_SOC_SHORTFALL_PENALTY = 0.5   # λ: penalty per kWh shortfall (time-slot model)
+UNIFIED_SYNTHETIC_TIME_PRICE_FACTOR = 0.0  # σ: bias charging toward earlier slots
+UNIFIED_TRIAD_PENALTY_FACTOR = 100.0  # τ: penalty per kWh during TRIAD periods
+UNIFIED_MAKESPAN_PENALTY_WEIGHT = 0   # μ: penalize late session starts (interval model)
+UNIFIED_TARGET_SOC_PERCENT = DEFAULT_TARGET_SOC_PERCENT
+UNIFIED_ENABLE_CHARGER_ALLOCATION = True
+UNIFIED_MIN_SESSION_DURATION_MINUTES = 30
+UNIFIED_SITE_CAPACITY_KW = 0.0
 
 # Unified optimizer time limits (seconds)
 UNIFIED_ALLOCATION_TIME_LIMIT = 30
 UNIFIED_SCHEDULING_TIME_LIMIT = 300
 UNIFIED_INTEGRATED_TIME_LIMIT = 330
+
+# In-process cron scheduler overrides (window/persist only; weights use UNIFIED_* above)
+SCHEDULED_WINDOW_HOURS = DEFAULT_PLANNING_WINDOW_HOURS
+SCHEDULED_PERSIST_TO_DATABASE = True
 

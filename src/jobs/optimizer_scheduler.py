@@ -13,11 +13,14 @@ from src.config import (
     OPTIMIZER_CRON_MINUTE,
     OPTIMIZER_SCHEDULER_ENABLED,
     OPTIMIZER_SITE_IDS,
+    SCHEDULED_PERSIST_TO_DATABASE,
+    SCHEDULED_WINDOW_HOURS,
 )
 from src.controllers.unified_controller import UnifiedController
 from src.jobs.db_clone import DbConfig, parse_site_ids
 from src.optimizer.unified_optimizer import (
     UnifiedOptimizationConfig,
+    default_unified_optimization_config,
     resolve_optimization_from_modes,
 )
 from src.utils.logging_config import logger
@@ -26,10 +29,6 @@ from src.utils.logging_config import logger
 OPTIMIZER_ADVISORY_LOCK_KEY = 0x4F50544D  # 'OPTM'
 
 SCHEDULED_MODE_FLAGS = ["allocation", "charge_scheduling"]
-SCHEDULED_ALLOCATION_SCORE_WEIGHT = 2.0
-SCHEDULED_SCHEDULING_COST_WEIGHT = 0.5
-SCHEDULED_WINDOW_HOURS = 24.0
-SCHEDULED_PERSIST_TO_DATABASE = True
 
 
 class OptimizerInProgressError(Exception):
@@ -44,12 +43,9 @@ def _configured_site_ids() -> List[int]:
 
 def _build_scheduled_config() -> UnifiedOptimizationConfig:
     opt_mode, enable_charger_allocation = resolve_optimization_from_modes(SCHEDULED_MODE_FLAGS)
-    return UnifiedOptimizationConfig(
-        mode=opt_mode,
-        allocation_score_weight=SCHEDULED_ALLOCATION_SCORE_WEIGHT,
-        scheduling_cost_weight=SCHEDULED_SCHEDULING_COST_WEIGHT,
-        enable_charger_allocation=enable_charger_allocation,
-    )
+    config = default_unified_optimization_config(opt_mode)
+    config.enable_charger_allocation = enable_charger_allocation
+    return config
 
 
 def _try_advisory_lock() -> Optional[psycopg2.extensions.connection]:
@@ -129,14 +125,15 @@ def execute_scheduled_optimization(
         if lock_conn is None:
             raise OptimizerInProgressError("Another scheduled optimization job is already running")
 
+    scheduled_config = _build_scheduled_config()
     logger.info(
         "Starting scheduled optimization for site %s (mode=%s, window_hours=%s, "
         "allocation_score_weight=%s, scheduling_cost_weight=%s)",
         site_id,
         SCHEDULED_MODE_FLAGS,
         SCHEDULED_WINDOW_HOURS,
-        SCHEDULED_ALLOCATION_SCORE_WEIGHT,
-        SCHEDULED_SCHEDULING_COST_WEIGHT,
+        scheduled_config.allocation_score_weight,
+        scheduled_config.scheduling_cost_weight,
     )
 
     try:

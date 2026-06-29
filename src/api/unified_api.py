@@ -60,6 +60,7 @@ from src.optimizer.unified_optimizer import (
     MODE_FLAG_CHARGE_SCHEDULING,
     MODE_FLAG_CHARGER_ALLOCATION,
     UnifiedOptimizationConfig,
+    default_unified_optimization_config,
     normalize_mode_input,
     resolve_optimization_from_modes,
 )
@@ -193,7 +194,10 @@ class UnifiedOptimizationRequest(BaseModel):
     scheduling_cost_weight: Optional[float] = Field(None, ge=0, description="β: weight for scheduling cost")
     target_soc_shortfall_penalty: Optional[float] = Field(None, ge=0, description="λ: penalty per kWh shortfall")
     triad_penalty_factor: Optional[float] = Field(None, ge=0, description="TRIAD period penalty factor")
-    synthetic_time_price_factor: Optional[float] = Field(None, ge=0, description="Time preference factor")
+    synthetic_time_price_factor: Optional[float] = Field(None, ge=0, description="Time preference factor (σ)")
+    makespan_penalty_weight: Optional[float] = Field(
+        None, ge=0, description="Early-start penalty for interval model (μ)"
+    )
     target_soc_percent: Optional[float] = Field(None, ge=0, le=100, description="Target SOC percentage")
     site_capacity_kw: Optional[float] = Field(None, ge=0, description="Site capacity in kW")
     enable_charger_allocation: Optional[bool] = Field(
@@ -332,48 +336,39 @@ def _build_config_from_request(req: UnifiedOptimizationRequest) -> UnifiedOptimi
     mode_flags = _mode_flags_from_request(req)
     opt_mode, enable_charger_from_mode = resolve_optimization_from_modes(mode_flags)
 
+    config = default_unified_optimization_config(opt_mode)
+
     if req.enable_charger_allocation is not None:
-        enable_charger_allocation = req.enable_charger_allocation
+        config.enable_charger_allocation = req.enable_charger_allocation
     else:
-        enable_charger_allocation = enable_charger_from_mode
+        config.enable_charger_allocation = enable_charger_from_mode
 
-    defaults = UnifiedOptimizationConfig(mode=opt_mode)
-    has_overrides = any([
-        req.allocation_time_limit is not None,
-        req.scheduling_time_limit is not None,
-        req.integrated_time_limit is not None,
-        req.route_count_weight is not None,
-        req.allocation_score_weight is not None,
-        req.scheduling_cost_weight is not None,
-        req.target_soc_shortfall_penalty is not None,
-        req.triad_penalty_factor is not None,
-        req.synthetic_time_price_factor is not None,
-        req.target_soc_percent is not None,
-        req.site_capacity_kw is not None,
-        req.enable_charger_allocation is not None,
-    ])
+    if req.allocation_time_limit is not None:
+        config.allocation_time_limit = req.allocation_time_limit
+    if req.scheduling_time_limit is not None:
+        config.scheduling_time_limit = req.scheduling_time_limit
+    if req.integrated_time_limit is not None:
+        config.integrated_time_limit = req.integrated_time_limit
+    if req.route_count_weight is not None:
+        config.route_count_weight = req.route_count_weight
+    if req.allocation_score_weight is not None:
+        config.allocation_score_weight = req.allocation_score_weight
+    if req.scheduling_cost_weight is not None:
+        config.scheduling_cost_weight = req.scheduling_cost_weight
+    if req.target_soc_shortfall_penalty is not None:
+        config.target_soc_shortfall_penalty = req.target_soc_shortfall_penalty
+    if req.triad_penalty_factor is not None:
+        config.triad_penalty_factor = req.triad_penalty_factor
+    if req.synthetic_time_price_factor is not None:
+        config.synthetic_time_price_factor = req.synthetic_time_price_factor
+    if req.makespan_penalty_weight is not None:
+        config.makespan_penalty_weight = req.makespan_penalty_weight
+    if req.target_soc_percent is not None:
+        config.target_soc_percent = req.target_soc_percent
+    if req.site_capacity_kw is not None:
+        config.site_capacity_kw = req.site_capacity_kw
 
-    if not has_overrides and enable_charger_allocation == defaults.enable_charger_allocation:
-        return UnifiedOptimizationConfig(
-            mode=opt_mode,
-            enable_charger_allocation=enable_charger_allocation,
-        )
-
-    return UnifiedOptimizationConfig(
-        mode=opt_mode,
-        allocation_time_limit=req.allocation_time_limit if req.allocation_time_limit is not None else defaults.allocation_time_limit,
-        scheduling_time_limit=req.scheduling_time_limit if req.scheduling_time_limit is not None else defaults.scheduling_time_limit,
-        integrated_time_limit=req.integrated_time_limit if req.integrated_time_limit is not None else defaults.integrated_time_limit,
-        route_count_weight=req.route_count_weight if req.route_count_weight is not None else defaults.route_count_weight,
-        allocation_score_weight=req.allocation_score_weight if req.allocation_score_weight is not None else defaults.allocation_score_weight,
-        scheduling_cost_weight=req.scheduling_cost_weight if req.scheduling_cost_weight is not None else defaults.scheduling_cost_weight,
-        target_soc_shortfall_penalty=req.target_soc_shortfall_penalty if req.target_soc_shortfall_penalty is not None else defaults.target_soc_shortfall_penalty,
-        triad_penalty_factor=req.triad_penalty_factor if req.triad_penalty_factor is not None else defaults.triad_penalty_factor,
-        synthetic_time_price_factor=req.synthetic_time_price_factor if req.synthetic_time_price_factor is not None else defaults.synthetic_time_price_factor,
-        target_soc_percent=req.target_soc_percent if req.target_soc_percent is not None else defaults.target_soc_percent,
-        site_capacity_kw=req.site_capacity_kw if req.site_capacity_kw is not None else defaults.site_capacity_kw,
-        enable_charger_allocation=enable_charger_allocation,
-    )
+    return config
 
 
 def _result_to_jsonable(result: Any) -> Dict[str, Any]:
